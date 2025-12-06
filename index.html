@@ -1,0 +1,2277 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Auto Life - 3B Group (AI Media, AI Factory)</title>
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    
+    <!-- Babel -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Font Awesome (Icons) -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <!-- Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- ffmpeg.wasm for converting WebM to MP4/AAC -->
+    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.10.1/dist/ffmpeg.min.js"></script>
+
+    <style>
+        body {
+            font-family: 'Prompt', sans-serif;
+            background-color: #f8fafc;
+        }
+        .gradient-text {
+            background: linear-gradient(to right, #4f46e5, #9333ea);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .tool-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+        }
+        .animate-fade-in {
+            animation: fadeIn 0.5s ease-in-out;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        /* Custom Scrollbar */
+        .custom-scroll::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        .custom-scroll::-webkit-scrollbar-track {
+            background: #f1f1f1; 
+        }
+        .custom-scroll::-webkit-scrollbar-thumb {
+            background: #cbd5e1; 
+            border-radius: 3px;
+        }
+        .custom-scroll::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8; 
+        }
+        .scrollbar-hide::-webkit-scrollbar {
+            display: none;
+        }
+        .scrollbar-hide {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+        /* Zoom animation for auto-cut hook effect */
+        .zoom-animation {
+            animation: zoomIn 4s linear forwards;
+        }
+        @keyframes zoomIn {
+            from { transform: scale(1); }
+            to { transform: scale(1.1); }
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // ==========================================
+        // 🔑 ส่วนตั้งค่า API KEY (ถ้าต้องการฝังถาวร)
+        // ==========================================
+        const FIXED_API_KEY = "BACKEND_MODE"; // ใช้โหมดเชื่อมผ่าน backend เสมอ
+        // ==========================================
+
+        // --- Helper Utilities ---
+        const downloadTxtFile = (filename, content) => {
+            const element = document.createElement("a");
+            const file = new Blob([content], {type: 'text/plain'});
+            element.href = URL.createObjectURL(file);
+            element.download = filename;
+            document.body.appendChild(element);
+            element.click();
+            document.body.removeChild(element);
+        };
+
+        const copyToClipboard = (text) => {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).catch(err => fallbackCopy(text));
+            } else {
+                fallbackCopy(text);
+            }
+        };
+
+        const fallbackCopy = (text) => {
+            const textArea = document.createElement("textarea");
+            textArea.value = text;
+            textArea.style.position = "fixed";
+            textArea.style.left = "-9999px";
+            document.body.appendChild(textArea);
+            textArea.focus();
+            textArea.select();
+            try {
+                document.execCommand('copy');
+            } catch (err) {
+                console.error('Fallback copy failed', err);
+            }
+            document.body.removeChild(textArea);
+        };
+
+        // --- REAL AI SERVICE (via backend Gemini proxy, no API key on frontend) ---
+        const callGeminiAI = async (apiKey, prompt, useSearch = false) => {
+            const url = 'http://localhost:4000/api/gemini-text';
+            let delay = 1000; // Start with 1 second delay
+            const maxRetries = 5;
+
+            const payload = { prompt, useSearch };
+
+            for (let i = 0; i <= maxRetries; i++) {
+                try {
+                    const response = await fetch(url, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (response.status === 503 || response.status === 429) {
+                        throw new Error(`Server Overloaded (Status: ${response.status})`);
+                    }
+
+                    const data = await response.json();
+
+                    if (data.error) {
+                        if (response.status === 503 || response.status === 429) {
+                            throw new Error(data.error);
+                        }
+                        throw new Error(data.error);
+                    }
+
+                    if (data.text) {
+                        return data.text;
+                    } else {
+                        throw new Error('ไม่ได้รับข้อความตอบกลับจาก AI');
+                    }
+                } catch (error) {
+                    console.warn(`Attempt ${i + 1} failed: ${error.message}`);
+                    if (i === maxRetries) {
+                        console.error('AI Fetch Error (Max Retries Reached):', error);
+                        return null;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    delay *= 2;
+                }
+            }
+            return null;
+        };
+
+        // --- Tool Logic Handlers ---
+        const generateSmartScript = async (data, apiKey) => {
+            const { product, tone, target, contentType } = data;
+            
+            if (apiKey) {
+                let systemPrompt = "";
+                if (contentType === 'podcast') {
+                    systemPrompt = `You are a professional TikTok Script Writer. Write a 60-second solo podcast script about "${product}". Target: ${target}. Tone: ${tone}. Structure: Hook, Value, CTA. Language: Thai. Use Emojis.`;
+                } else if (contentType === 'service') {
+                    systemPrompt = `Write a TikTok script to promote a service: "${product}". Target: ${target}. Tone: ${tone}. Focus on trust. Language: Thai. Use Emojis.`;
+                } else {
+                    systemPrompt = `Write a TikTok product review script for "${product}". Target: ${target}. Tone: ${tone}. Include: Hook, 3 Benefits, CTA. Language: Thai. Use Emojis.`;
+                }
+                const aiResult = await callGeminiAI(apiKey, systemPrompt);
+                if (aiResult) return aiResult;
+                return "⚠️ เกิดข้อผิดพลาดในการเชื่อมต่อ AI (ใช้ Mockup แทน)";
+            }
+
+            // Mockup Logic
+            const random = (arr) => arr[Math.floor(Math.random() * arr.length)];
+            const getHook = () => random([`หยุดเลื่อน! ถ้าชอบ ${product}`, `ความลับของ ${product} ที่ไม่มีใครบอก`, `เชื่อไหม? ${product} เปลี่ยนชีวิตได้`]);
+            return `(Mockup Script for ${product})\n\nHOOK: ${getHook()}\nCONTENT: เนื้อหาดีๆ...\nCTA: กดตะกร้าเลย!`;
+        };
+
+        const mockViralTrends = (niche) => {
+            const baseUrl = "https://www.tiktok.com/search?q=";
+            const trends = {
+                'Daily Hot': [
+                    { title: 'เงินดิจิทัลล่าสุด', query: 'เงินดิจิทัล 10000 ล่าสุด', views: '5.2M', trend: '🔥 Top 1' },
+                    { title: 'ที่เที่ยวหน้าหนาว', query: 'ที่เที่ยวหน้าหนาว 2024', views: '4.8M', trend: '🔥 Top 2' },
+                    { title: 'เพลงฮิต TikTok', query: 'เพลงฮิต tiktok', views: '3.5M', trend: '🔥 Top 3' },
+                    { title: 'รีวิว iPhone 16', query: 'รีวิว iPhone 16', views: '2.9M', trend: '🔥 Top 4' },
+                    { title: 'เมนูไข่ง่ายๆ', query: 'เมนูไข่ง่ายๆ', views: '2.1M', trend: '🔥 Top 5' },
+                ],
+                'Skincare': [
+                    { title: 'รีวิวครีมซอง', query: 'รีวิวครีมซองเซเว่น', views: '1.2M', trend: 'Rising 📈' },
+                    { title: 'ASMR ล้างหน้า', query: 'ASMR skincare routine', views: '2.5M', trend: 'Viral 🌟' },
+                ]
+            };
+            const list = trends[niche] || [{ title: `${niche} มาแรง`, query: `${niche} trend`, views: '1M+', trend: 'Hot 🔥' }];
+            return list.map((t, i) => ({ ...t, id: i + 1, url: baseUrl + encodeURIComponent(t.query) }));
+        };
+
+        // --- Components ---
+
+        const Navbar = ({ setPage, activePage, toggleMobileMenu, isMobileMenuOpen, setApiKey, apiKey }) => {
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [tempKey, setTempKey] = useState('');
+
+            useEffect(() => { if(isModalOpen) setTempKey(apiKey || ''); }, [isModalOpen, apiKey]);
+
+            const handleSaveKey = () => {
+                setApiKey(tempKey);
+                localStorage.setItem('autoLife_apiKey', tempKey);
+                setIsModalOpen(false);
+                if(tempKey) alert("✅ บันทึก API Key เรียบร้อยแล้ว!");
+            };
+
+            return (
+                <>
+                    <nav className="bg-white shadow-md fixed w-full z-50">
+                        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div className="flex justify-between h-16">
+                                <div className="flex items-center cursor-pointer" onClick={() => setPage('home')}>
+                                    <div className="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center mr-2 shadow-lg">
+                                        <i className="fa-solid fa-brain text-white text-xl"></i>
+                                    </div>
+                                    <div>
+                                        <div className="flex items-center gap-2">
+                                            <h1 className="text-xl font-bold text-gray-800">Auto Life</h1>
+                                            <span className="bg-orange-100 text-orange-600 text-[10px] font-bold px-2 py-0.5 rounded-full border border-orange-200">BETA</span>
+                                        </div>
+                                        <p className="text-[10px] text-indigo-600 font-bold uppercase tracking-wider">by 3B Group</p>
+                                    </div>
+                                </div>
+                                <div className="hidden md:flex items-center space-x-6">
+                                    {['home', 'about', 'services', 'tools', 'team', 'contact'].map(page => (
+                                        <button key={page} onClick={() => setPage(page)} className={`capitalize font-medium transition ${activePage === page ? 'text-indigo-600' : 'text-gray-600 hover:text-indigo-600'}`}>
+                                            {page === 'home' ? 'หน้าแรก' : page === 'about' ? 'เกี่ยวกับเรา' : page === 'services' ? 'บริการ' : page === 'tools' ? 'AI Tools' : page === 'team' ? 'ทีมงาน' : 'ติดต่อเรา'}
+                                        </button>
+                                    ))}
+                                    {/* Hide the API key button in production. Only show it in development mode. */}
+                                    {IS_DEV && (
+                                        <button onClick={() => setIsModalOpen(true)} className={`px-4 py-2 rounded-full text-xs font-bold border flex items-center gap-2 ${apiKey ? 'bg-green-100 text-green-700 border-green-200' : 'bg-gray-100 text-gray-600 border-gray-200 hover:text-indigo-600'}`}>
+                                            <i className={`fa-solid ${apiKey ? 'fa-robot' : 'fa-key'}`}></i> {apiKey ? 'Active' : 'Set Key'}
+                                        </button>
+                                    )}
+                                    <a href="https://line.me/ti/p/~bum77" target="_blank" className="bg-[#06C755] text-white px-4 py-2 rounded-full hover:bg-[#05b04d] text-sm font-bold">
+                                        <i className="fa-brands fa-line mr-1"></i> bum77
+                                    </a>
+                                </div>
+                                <div className="md:hidden flex items-center">
+                                    <button onClick={toggleMobileMenu}><i className={`fas ${isMobileMenuOpen ? 'fa-times' : 'fa-bars'} text-2xl text-gray-600`}></i></button>
+                                </div>
+                            </div>
+                        </div>
+                        {isMobileMenuOpen && (
+                            <div className="md:hidden bg-white border-t px-4 pt-2 pb-4 space-y-1">
+                                {['home', 'about', 'services', 'tools', 'team', 'contact'].map(page => (
+                                    <button key={page} onClick={() => { setPage(page); toggleMobileMenu(); }} className="block w-full text-left py-2 text-gray-700 hover:text-indigo-600 capitalize">{page}</button>
+                                ))}
+                                {/* Hide the AI key option in the mobile menu unless in development mode */}
+                                {IS_DEV && (
+                                    <button onClick={() => { setIsModalOpen(true); toggleMobileMenu(); }} className="block w-full text-left py-2 text-gray-700 hover:text-indigo-600"><i className="fa-solid fa-key mr-2"></i> ตั้งค่า AI Key</button>
+                                )}
+                            </div>
+                        )}
+                    </nav>
+                    {/* Render the API key modal only in development mode */}
+                    {IS_DEV && isModalOpen && (
+                        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden transform transition-all scale-100">
+                                <div className="bg-indigo-600 px-6 py-4 flex justify-between items-center text-white"><h3 className="font-bold text-lg flex items-center gap-2"><i className="fa-solid fa-robot"></i> ตั้งค่า AI Brain</h3><button onClick={() => setIsModalOpen(false)}><i className="fa-solid fa-times"></i></button></div>
+                                <div className="p-6">
+                                    <p className="text-gray-600 text-sm mb-4">ใส่ Google Gemini API Key เพื่อใช้งาน AI สมองจริง</p>
+                                    <input type="password" value={tempKey} onChange={(e) => setTempKey(e.target.value)} className="w-full border p-3 rounded-xl mb-4" placeholder="AIza..." />
+                                    <div className="flex gap-2"><a href="https://aistudio.google.com/app/apikey" target="_blank" className="flex-1 bg-gray-100 text-gray-600 py-3 rounded-xl text-center text-sm font-bold border">ขอ Key ฟรี</a><button onClick={handleSaveKey} className="flex-1 bg-indigo-600 text-white py-3 rounded-xl text-sm font-bold shadow-lg">บันทึกใช้งาน</button></div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </>
+            );
+        };
+
+        const Hero = ({ setPage }) => (
+            <div className="pt-28 pb-16 bg-gradient-to-b from-indigo-50 via-white to-gray-50 relative overflow-hidden">
+                <div className="absolute top-0 right-0 -mr-20 -mt-20 w-96 h-96 bg-purple-200 rounded-full mix-blend-multiply filter blur-3xl opacity-30 animate-blob"></div>
+                <div className="absolute top-0 left-0 -ml-20 -mt-20 w-96 h-96 bg-indigo-200 rounded-full mix-blend-multiply filter blur-3xl opacity-30 animate-blob animation-delay-2000"></div>
+                
+                <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col md:flex-row items-center relative z-10">
+                    <div className="md:w-1/2 text-center md:text-left mb-12 md:mb-0">
+                        <div className="inline-flex items-center bg-white border border-indigo-100 rounded-full px-4 py-1.5 mb-6 shadow-sm">
+                            <span className="w-2 h-2 bg-green-500 rounded-full mr-2 animate-pulse"></span>
+                            <span className="text-xs font-bold text-indigo-800 tracking-wide uppercase">AI Media & AI Factory Solutions</span>
+                        </div>
+                        <h1 className="text-4xl md:text-6xl font-extrabold text-gray-900 mb-6 leading-[1.2]">
+                            สร้างคอนเทนต์ให้ปัง<br/>ด้วยพลัง <span className="gradient-text">Gemini Brain</span>
+                        </h1>
+                        <p className="text-lg text-gray-600 mb-8 max-w-lg mx-auto md:mx-0 leading-relaxed">
+                            Auto Life แพลตฟอร์มผู้ช่วยอัจฉริยะสำหรับ 3B Group ช่วยคุณสร้างสคริปต์ หาเทรนด์ไวรัล และจัดการงานขายแบบอัตโนมัติ
+                        </p>
+                        <div className="flex flex-col sm:flex-row gap-4 justify-center md:justify-start">
+                            <button onClick={() => setPage('tools')} className="bg-indigo-600 text-white px-8 py-3.5 rounded-xl hover:bg-indigo-700 transition shadow-lg hover:shadow-indigo-500/30 font-bold flex items-center justify-center group">
+                                <i className="fa-solid fa-wand-magic-sparkles mr-2 group-hover:rotate-12 transition"></i> เริ่มใช้งาน AI Tools
+                            </button>
+                            <button onClick={() => setPage('contact')} className="bg-white text-gray-700 border border-gray-200 px-8 py-3.5 rounded-xl hover:bg-gray-50 transition font-bold shadow-sm hover:shadow-md">
+                                ติดต่อทีมงาน
+                            </button>
+                        </div>
+                    </div>
+                    <div className="md:w-1/2 flex justify-center perspective-1000">
+                         <div className="relative w-full max-w-md transform transition hover:scale-[1.02] duration-500">
+                            <div className="absolute -inset-1 bg-gradient-to-r from-indigo-500 to-purple-600 rounded-2xl blur opacity-20"></div>
+                            <div className="relative bg-white p-6 rounded-2xl shadow-2xl border border-gray-100">
+                                <div className="flex items-center gap-4 mb-6 border-b border-gray-100 pb-4">
+                                    <div className="w-12 h-12 bg-indigo-600 rounded-xl flex items-center justify-center text-white shadow-lg">
+                                        <i className="fa-solid fa-robot text-2xl"></i>
+                                    </div>
+                                    <div>
+                                        <h3 className="font-bold text-gray-800 text-lg">AI Assistant</h3>
+                                        <div className="flex items-center text-xs text-green-500 font-medium">
+                                            <span className="w-1.5 h-1.5 bg-green-500 rounded-full mr-1.5"></span>
+                                            Online & Ready
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="space-y-4">
+                                    <div className="flex gap-3">
+                                        <div className="w-8 h-8 bg-gray-200 rounded-full flex-shrink-0"></div>
+                                        <div className="bg-gray-100 p-3 rounded-2xl rounded-tl-none text-sm text-gray-600 w-3/4">
+                                            ช่วยเขียนสคริปต์ Podcast เรื่อง "Mindset คนรวย" หน่อยครับ
+                                        </div>
+                                    </div>
+                                    <div className="flex gap-3 flex-row-reverse">
+                                        <div className="w-8 h-8 bg-indigo-100 text-indigo-600 rounded-full flex items-center justify-center flex-shrink-0"><i className="fa-solid fa-robot text-xs"></i></div>
+                                        <div className="bg-indigo-600 p-3 rounded-2xl rounded-tr-none text-sm text-white w-3/4 shadow-md">
+                                            <p className="font-bold mb-1">🎙️ Podcast Script:</p>
+                                            <p>"เคยสงสัยไหมว่าคนรวยเขาคิดต่างจากเรายังไง? วันนี้ผมมี 3 บทเรียนมาเล่าให้ฟัง..."</p>
+                                        </div>
+                                    </div>
+                                    <div className="h-2"></div>
+                                    <div className="flex items-center justify-center text-xs text-gray-400">
+                                        <i className="fa-solid fa-bolt text-yellow-400 mr-1"></i> Powered by 3B Group AI
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        );
+
+        // --- Tool 1: AI Script Maker ---
+        const Tool1_ScriptMaker = ({ apiKey }) => {
+            const [formData, setFormData] = useState({
+                product: '',
+                tone: 'exciting',
+                target: 'วัยทำงาน',
+                duration: '60 วินาที (Short)',
+                contentType: 'product'
+            });
+            const [result, setResult] = useState('');
+            const [isThinking, setIsThinking] = useState(false);
+            const [progress, setProgress] = useState(0);
+
+            // Helper functions specifically for this component
+            const getPlaceholder = () => {
+                if (formData.contentType === 'podcast') return "เช่น การหัดใช้ AI, Mindset คนสำเร็จ, เล่าเรื่องผี";
+                if (formData.contentType === 'service') return "เช่น บริการล้างแอร์, คลินิกทำฟัน, คอร์สออนไลน์";
+                return "เช่น ครีมกันแดด, หูฟังไร้สาย, อาหารเสริม";
+            };
+
+            const getLabel = () => {
+                if (formData.contentType === 'podcast') return "หัวข้อ Podcast";
+                if (formData.contentType === 'service') return "ชื่อบริการ/ธุรกิจ";
+                return "ชื่อสินค้า";
+            };
+
+            const handleGenerate = async () => {
+                if(!formData.product) return;
+                setIsThinking(true);
+                setProgress(0);
+                setResult('');
+
+                // Progress bar animation
+                const interval = setInterval(() => {
+                    setProgress(old => {
+                        if (old >= 90) return 90;
+                        return old + Math.floor(Math.random() * 20);
+                    });
+                }, 300);
+
+                // Call AI (Real or Mock)
+                const generatedScript = await generateSmartScript(formData, apiKey);
+                
+                clearInterval(interval);
+                setProgress(100);
+                setTimeout(() => {
+                    setIsThinking(false);
+                    setResult(generatedScript);
+                }, 500);
+            };
+
+            return (
+                <div className="animate-fade-in max-w-3xl mx-auto">
+                    <div className="flex items-center mb-6">
+                        <div className="p-3 bg-indigo-100 rounded-lg text-indigo-600 mr-4">
+                            <i className="fa-solid fa-file-pen text-2xl"></i>
+                        </div>
+                        <div>
+                            <div className="flex items-center gap-2">
+                                <h3 className="text-2xl font-bold text-gray-800">AI Script Maker</h3>
+                                {apiKey && <span className="bg-green-100 text-green-700 text-xs px-2 py-0.5 rounded-full border border-green-200 font-bold">Real AI Mode</span>}
+                            </div>
+                            <p className="text-gray-500 text-sm">ระบบอัจฉริยะวิเคราะห์และสร้างสคริปต์ที่ "ตอบโจทย์ทุกคอนเทนต์"</p>
+                        </div>
+                    </div>
+
+                    <div className="bg-white p-8 rounded-2xl shadow-lg border border-gray-100 mb-8 relative overflow-hidden">
+                        {isThinking && (
+                            <div className="absolute top-0 left-0 w-full h-1 bg-gray-100">
+                                <div className="h-full bg-gradient-to-r from-indigo-500 to-purple-500 transition-all duration-300" style={{width: `${progress}%`}}></div>
+                            </div>
+                        )}
+                        
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                            {/* Type Selection */}
+                            <div className="md:col-span-2">
+                                <label className="block text-gray-700 text-sm font-bold mb-3">
+                                    <i className="fa-solid fa-layer-group mr-1"></i> เลือกประเภทคอนเทนต์
+                                </label>
+                                <div className="grid grid-cols-3 gap-3">
+                                    <button 
+                                        onClick={() => setFormData({...formData, contentType: 'product'})}
+                                        className={`py-3 px-4 rounded-xl text-sm font-bold transition flex flex-col items-center justify-center gap-2 border ${formData.contentType === 'product' ? 'bg-indigo-50 border-indigo-500 text-indigo-700 ring-1 ring-indigo-500' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'}`}
+                                    >
+                                        <i className="fa-solid fa-box-open text-lg"></i>
+                                        ขายสินค้า
+                                    </button>
+                                    <button 
+                                        onClick={() => setFormData({...formData, contentType: 'service'})}
+                                        className={`py-3 px-4 rounded-xl text-sm font-bold transition flex flex-col items-center justify-center gap-2 border ${formData.contentType === 'service' ? 'bg-blue-50 border-blue-500 text-blue-700 ring-1 ring-blue-500' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'}`}
+                                    >
+                                        <i className="fa-solid fa-handshake text-lg"></i>
+                                        บริการ/ธุรกิจ
+                                    </button>
+                                    <button 
+                                        onClick={() => setFormData({...formData, contentType: 'podcast'})}
+                                        className={`py-3 px-4 rounded-xl text-sm font-bold transition flex flex-col items-center justify-center gap-2 border ${formData.contentType === 'podcast' ? 'bg-purple-50 border-purple-500 text-purple-700 ring-1 ring-purple-500' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'}`}
+                                    >
+                                        <i className="fa-solid fa-microphone text-lg"></i>
+                                        Podcast เดี่ยว
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div className="md:col-span-2">
+                                <label className="block text-gray-700 text-sm font-bold mb-2">
+                                    {getLabel()}
+                                </label>
+                                <input 
+                                    type="text" 
+                                    className="w-full bg-gray-50 border border-gray-200 text-gray-800 rounded-xl py-3 px-4 leading-tight focus:outline-none focus:bg-white focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 transition" 
+                                    placeholder={getPlaceholder()}
+                                    value={formData.product}
+                                    onChange={(e) => setFormData({...formData, product: e.target.value})}
+                                />
+                            </div>
+                            
+                            <div>
+                                <label className="block text-gray-700 text-sm font-bold mb-2">
+                                    <i className="fa-solid fa-masks-theater mr-1"></i> โทนของคลิป
+                                </label>
+                                <select 
+                                    className="w-full bg-gray-50 border border-gray-200 text-gray-800 rounded-xl py-3 px-4 focus:outline-none focus:bg-white focus:border-indigo-500"
+                                    value={formData.tone}
+                                    onChange={(e) => setFormData({...formData, tone: e.target.value})}
+                                >
+                                    <option value="exciting">🔥 ตื่นเต้น/เร้าใจ</option>
+                                    <option value="friendly">🥰 เป็นกันเอง</option>
+                                    <option value="professional">🏆 ทางการ/น่าเชื่อถือ</option>
+                                    <option value="storytelling">🎙️ เล่าเรื่อง</option>
+                                    <option value="urgent">⚠️ เร่งด่วน</option>
+                                </select>
+                            </div>
+
+                            <div>
+                                <label className="block text-gray-700 text-sm font-bold mb-2">
+                                    <i className="fa-solid fa-users mr-1"></i> กลุ่มเป้าหมาย
+                                </label>
+                                <input 
+                                    type="text" 
+                                    className="w-full bg-gray-50 border border-gray-200 text-gray-800 rounded-xl py-3 px-4 focus:outline-none focus:bg-white focus:border-indigo-500" 
+                                    placeholder="เช่น วัยรุ่น, แม่บ้าน..."
+                                    value={formData.target}
+                                    onChange={(e) => setFormData({...formData, target: e.target.value})}
+                                />
+                            </div>
+                        </div>
+
+                        <button 
+                            onClick={handleGenerate}
+                            className={`w-full text-white font-bold py-4 px-6 rounded-xl focus:outline-none transition shadow-lg transform hover:-translate-y-1 ${isThinking ? 'bg-gray-400 cursor-not-allowed' : 'bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700'}`}
+                            disabled={isThinking}
+                        >
+                            {isThinking ? (
+                                <span className="flex items-center justify-center">
+                                    <i className="fas fa-circle-notch fa-spin mr-2"></i> กำลังคิดวิเคราะห์... ({progress}%)
+                                </span>
+                            ) : (
+                                <span className="flex items-center justify-center text-lg">
+                                    <i className="fa-solid fa-wand-magic-sparkles mr-2"></i> สร้างสคริปต์อัจฉริยะ
+                                </span>
+                            )}
+                        </button>
+                    </div>
+
+                    {result && (
+                        <div className="bg-gray-900 text-gray-100 p-6 rounded-2xl shadow-xl border border-gray-700 relative animate-fade-in">
+                            <div className="flex justify-between items-center mb-4 border-b border-gray-700 pb-3">
+                                <div className="flex items-center gap-2">
+                                    <span className="text-xs text-gray-400 font-mono">script_result.txt</span>
+                                </div>
+                                <div className="flex gap-2">
+                                    <button className="text-gray-400 hover:text-white transition flex items-center gap-1 text-xs" onClick={() => downloadTxtFile('script.txt', result)}>
+                                        <i className="fa-solid fa-download"></i> Save
+                                    </button>
+                                    <button className="text-gray-400 hover:text-white transition flex items-center gap-1 text-xs" onClick={() => copyToClipboard(result)}>
+                                        <i className="far fa-copy"></i> Copy
+                                    </button>
+                                </div>
+                            </div>
+                            <pre className="whitespace-pre-wrap font-mono text-sm leading-relaxed text-green-300">{result}</pre>
+                            
+                            <div className="mt-6 p-4 bg-gray-800 rounded-xl border border-gray-700 flex items-start gap-3">
+                                <i className="fa-solid fa-lightbulb text-yellow-400 mt-1"></i>
+                                <div>
+                                    <h5 className="font-bold text-white text-sm">AI Suggestion:</h5>
+                                    <p className="text-xs text-gray-400 mt-1">
+                                        {apiKey ? "นี่คือสคริปต์ที่สร้างจาก AI จริง หากต้องการผลลัพธ์ที่หลากหลายขึ้น ลองเปลี่ยน Tone หรือ Target ดูนะครับ" : "นี่คือสคริปต์จำลอง หากต้องการให้ AI เขียนสดใหม่ทุกครั้ง กรุณาใส่ API Key ที่ปุ่มด้านบนครับ"}
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // --- Tool 2: Viral Finder (Enhanced, Backend AI) ---
+        const Tool2_ViralFinder = ({ apiKey }) => {
+            const [niche, setNiche] = useState('Daily Hot');
+            const [results, setResults] = useState([]);
+            const [isLoading, setIsLoading] = useState(false);
+            
+            useEffect(() => {
+                const fetchTrends = async () => {
+                    setIsLoading(true);
+                    try {
+                        const prompt = `You are a TikTok viral content analyst.
+
+Analyze current TikTok viral trends in Thailand for the niche "${niche}".
+Focus on the last 24–72 hours and typical behavior on Thai TikTok.
+
+Return ONLY a JSON array (no markdown, no explanation) of 5–8 items.
+Each item MUST have this exact structure and field names:
+
+[
+  {
+    "title": "short Thai title of the trend",
+    "views": "approximate views string in Thai, e.g. 1-3 ล้านวิว หรือ กำลังมาแรง",
+    "hook": "Thai explanation of the psychological hook that stops scrolling",
+    "reason": "Thai analysis of WHY this trend goes viral (รูปแบบเนื้อหา, เสียง, อารมณ์, ความใหม่ ฯลฯ)",
+    "idea": "Thai suggestion for how a creator or brand can adapt this trend",
+    "prompt": "concise English image prompt for an AI thumbnail/cover for this trend",
+    "query": "short Thai keyword to search this trend on TikTok",
+    "trend": "one of: 🔥 Hot now, 📈 Rising, 💎 Evergreen"
+  }
+]
+
+Make sure every object contains all fields with non-empty values.`.trim();
+
+                        const res = await callGeminiAI(apiKey || 'BACKEND_MODE', prompt, true);
+
+                        if (!res) {
+                            setResults(mockViralTrends(niche));
+                            return;
+                        }
+
+                        let jsonStr = res.replace(/```json\\s*|```/gi, '').trim();
+                        const firstBracket = jsonStr.indexOf('[');
+                        const lastBracket = jsonStr.lastIndexOf(']');
+                        if (firstBracket !== -1 && lastBracket !== -1) {
+                            jsonStr = jsonStr.substring(firstBracket, lastBracket + 1);
+                        }
+
+                        let raw;
+                        try {
+                            raw = JSON.parse(jsonStr);
+                        } catch (e) {
+                            console.warn('Viral Finder JSON parse error, fallback to mock', e);
+                            setResults(mockViralTrends(niche));
+                            return;
+                        }
+
+                        if (!Array.isArray(raw) || !raw.length) {
+                            setResults(mockViralTrends(niche));
+                            return;
+                        }
+
+                        const mapped = raw.map((t, idx) => {
+                            const title = t.title || t.topic || t.name || `ไวรัล #${idx + 1}`;
+                            const query = t.query || t.keyword || title;
+                            const views = t.views || t.popularity || '';
+                            const hook = t.hook || t.hook_th || t.hookIdea || t['hook_thai'] || '';
+                            const reason = t.reason || t.why || t.analysis || t['why_viral'] || '';
+                            const idea = t.idea || t.contentIdea || t['idea_thai'] || '';
+                            const prompt = t.prompt || t.imagePrompt || t.thumbnailPrompt || '';
+
+                            return {
+                                id: idx + 1,
+                                title,
+                                views: views || 'กำลังมาแรงบน TikTok',
+                                hook: hook || `ใช้มุมเล่าเรื่องแบบ "${title}" ให้โดนใจคนดูด้วยอารมณ์ชัด ๆ เช่น curiosity / ความกลัวพลาด / ความหวัง`,
+                                reason: reason || `คลิปแนว "${title}" ตรงกับพฤติกรรมการดู TikTok ตอนนี้ เช่น ดูสั้น ๆ เข้าใจง่าย ใช้เสียง/มีมที่กำลังเป็นกระแส หรือมี before-after ชัดเจน`,
+                                idea: idea || `หยิบไอเดีย "${title}" มาปรับให้เข้ากับสินค้า/แบรนด์ของคุณ แล้วเล่าผ่านประสบการณ์จริงหรือสตอรี่ของลูกค้า`,
+                                prompt: prompt || `cinematic vertical thumbnail about ${title}, vibrant colors, clear subject, depth of field, trending on TikTok`,
+                                trend: t.trend || (idx < 2 ? '🔥 Hot now' : '📈 Rising'),
+                                url: `https://www.tiktok.com/search?q=${encodeURIComponent(query)}`
+                            };
+                        });
+
+                        setResults(mapped);
+                    } catch (error) {
+                        console.error('Viral Finder AI error:', error);
+                        setResults(mockViralTrends(niche));
+                    } finally {
+                        setIsLoading(false);
+                    }
+                };
+                fetchTrends();
+            }, [niche, apiKey]);
+
+            return (
+                <div className="animate-fade-in max-w-4xl mx-auto">
+                    <div className="flex items-center mb-6 gap-3">
+                        <div className="bg-orange-100 text-orange-700 p-2 rounded-xl">
+                            <i className="fa-solid fa-fire-flame-curved text-xl"></i>
+                        </div>
+                        <div>
+                            <h2 className="text-xl font-bold text-gray-900 flex items-center gap-2">
+                                AI Viral Finder
+                                {apiKey && <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full border border-green-200">Real-Time</span>}
+                            </h2>
+                            <p className="text-sm text-gray-500">
+                                วิเคราะห์เทรนด์เชิงลึก 4 มิติ (Hook, Reason, Idea, Prompt)
+                            </p>
+                        </div>
+                    </div>
+
+                    <div className="flex gap-3 mb-6 overflow-x-auto no-scrollbar pb-1">
+                        {['Daily Hot', 'Skincare', 'Gadget', 'Fashion', 'Food', 'Education', 'Pet', 'Business'].map(cat => (
+                            <button
+                                key={cat}
+                                onClick={() => setNiche(cat)}
+                                className={`px-4 py-2 rounded-full text-sm border transition flex items-center gap-1 ${
+                                    niche === cat
+                                        ? 'bg-orange-500 text-white border-orange-500 shadow-sm'
+                                        : 'bg-white text-gray-700 border-gray-200 hover:border-orange-300 hover:text-orange-600'
+                                }`}
+                            >
+                                {niche === cat && <i className="fa-solid fa-bolt text-yellow-300 mr-1"></i>}
+                                {cat}
+                            </button>
+                        ))}
+                    </div>
+                    
+                    {isLoading ? (
+                        <div className="text-center py-12 text-gray-500">
+                            <i className="fa-solid fa-circle-notch fa-spin text-3xl mb-3"></i>
+                            <p>กำลังวิเคราะห์เทรนด์ล่าสุดจาก AI...</p>
+                        </div>
+                    ) : (
+                        <div className="grid grid-cols-1 gap-6">
+                            {results.map((item, i) => (
+                                <div
+                                    key={i}
+                                    className="bg-white rounded-2xl border border-gray-200 shadow-sm hover:shadow-md transition p-6 flex flex-col h-full relative overflow-hidden group"
+                                >
+                                    <div className="flex justify-between items-start mb-4">
+                                        <div>
+                                            <div className="flex items-center gap-2 mb-1">
+                                                <span className="bg-orange-100 text-orange-700 text-xs font-bold px-2 py-0.5 rounded">
+                                                    #{i + 1} Trending
+                                                </span>
+                                                <span className="text-gray-400 text-xs">
+                                                    <i className="fa-solid fa-eye"></i> {item.views}
+                                                </span>
+                                            </div>
+                                            <h4 className="text-lg font-bold text-gray-900 flex items-center gap-2">
+                                                {item.title}
+                                                {item.url && (
+                                                    <a
+                                                        href={item.url}
+                                                        target="_blank"
+                                                        rel="noreferrer"
+                                                        className="text-xs text-blue-500 hover:text-blue-600 flex items-center gap-1"
+                                                    >
+                                                        <i className="fa-solid fa-arrow-up-right-from-square text-xs opacity-50"></i>
+                                                    </a>
+                                                )}
+                                            </h4>
+                                        </div>
+                                    </div>
+                                    
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                                        <div className="bg-red-50 p-4 rounded-xl border border-red-100">
+                                            <div className="text-red-700 font-bold text-sm mb-1 flex items-center gap-2">
+                                                <i className="fa-solid fa-magnet"></i> The Hook (จิตวิทยา)
+                                            </div>
+                                            <p className="text-gray-700 text-sm leading-relaxed">{item.hook}</p>
+                                        </div>
+                                        <div className="bg-blue-50 p-4 rounded-xl border border-blue-100">
+                                            <div className="text-blue-700 font-bold text-sm mb-1 flex items-center gap-2">
+                                                <i className="fa-solid fa-flask"></i> Why it's Viral (วิเคราะห์)
+                                            </div>
+                                            <p className="text-gray-700 text-sm leading-relaxed">{item.reason}</p>
+                                        </div>
+                                    </div>
+
+                                    <div className="bg-green-50 p-4 rounded-xl border border-green-100 mb-4">
+                                        <div className="text-green-700 font-bold text-sm mb-1 flex items-center gap-2">
+                                            <i className="fa-regular fa-lightbulb"></i> Content Idea (แนะนำ)
+                                        </div>
+                                        <p className="text-gray-800 leading-relaxed">{item.idea}</p>
+                                    </div>
+
+                                    <div className="border-t pt-3 mt-3 bg-gray-50 p-3 rounded-lg">
+                                        <div className="flex justify-between items-center mb-1">
+                                            <span className="text-gray-700 text-xs font-semibold flex items-center gap-1">
+                                                <i className="fa-solid fa-image"></i> Image Prompt
+                                            </span>
+                                            <button
+                                                className="text-xs text-blue-500 hover:text-blue-600 underline"
+                                                onClick={() => copyToClipboard(item.prompt)}
+                                            >
+                                                Copy
+                                            </button>
+                                        </div>
+                                        <p
+                                            className="text-xs text-gray-500 font-mono truncate cursor-pointer hover:text-gray-600"
+                                            onClick={() => copyToClipboard(item.prompt)}
+                                            title={item.prompt}
+                                        >
+                                            {item.prompt}
+                                        </p>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+// --- Tool 3: Review Gen (Enhanced) ---
+        const Tool3_ReviewGen = ({ apiKey }) => {
+            const [productLink, setProductLink] = useState('');
+            const [productName, setProductName] = useState('');
+            const [selectedTone, setSelectedTone] = useState('sincere');
+            const [isGenerating, setIsGenerating] = useState(false);
+            const [generatedReview, setGeneratedReview] = useState(null);
+            const [sellers, setSellers] = useState([
+                { id: 1, name: 'เซรั่มเลิฟโพชั่น', img: 'https://placehold.co/100x100/pink/white?text=Serum' },
+                { id: 2, name: 'คอนแทคเลนส์ Glitz', img: 'https://placehold.co/100x100/blue/white?text=Lens' },
+                { id: 3, name: 'ยาดมสมุนไพร', img: 'https://placehold.co/100x100/green/white?text=Inhaler' },
+                { id: 4, name: 'ลิปแมท 4U2', img: 'https://placehold.co/100x100/red/white?text=Lip' },
+                { id: 5, name: 'กระเป๋า Jelly Bunny', img: 'https://placehold.co/100x100/purple/white?text=Bag' },
+                { id: 6, name: 'แก้วเก็บความเย็น', img: 'https://placehold.co/100x100/silver/black?text=Cup' },
+                { id: 7, name: 'คุชชั่น Laneige', img: 'https://placehold.co/100x100/teal/white?text=Cushion' },
+                { id: 8, name: 'มาร์คหน้า Banobagi', img: 'https://placehold.co/100x100/yellow/black?text=Mask' },
+                { id: 9, name: 'น้ำหอม Janua', img: 'https://placehold.co/100x100/pink/black?text=Perfume' },
+                { id: 10, name: 'เสื้อยืด Oversize', img: 'https://placehold.co/100x100/black/white?text=Shirt' },
+                { id: 11, name: 'ขาตั้งกล้อง P180', img: 'https://placehold.co/100x100/grey/white?text=Tripod' },
+                { id: 12, name: 'ไมค์ไร้สาย K9', img: 'https://placehold.co/100x100/black/white?text=Mic' },
+                { id: 13, name: 'อาหารเสริม Glory', img: 'https://placehold.co/100x100/orange/white?text=Collagen' },
+                { id: 14, name: 'สบู่ Bennet', img: 'https://placehold.co/100x100/orange/black?text=Soap' },
+                { id: 15, name: 'กันแดด Mizumi', img: 'https://placehold.co/100x100/blue/white?text=Sunscreen' },
+                { id: 16, name: 'ขนมเปี๊ยะลาวา', img: 'https://placehold.co/100x100/brown/white?text=Snack' },
+                { id: 17, name: 'Powerbank Eloop', img: 'https://placehold.co/100x100/white/black?text=Power' },
+                { id: 18, name: 'หูฟัง Lenovo', img: 'https://placehold.co/100x100/black/white?text=Headset' },
+                { id: 19, name: 'เครื่องม้วนผม', img: 'https://placehold.co/100x100/pink/white?text=Curler' },
+                { id: 20, name: 'กระติกน้ำเด็ก', img: 'https://placehold.co/100x100/cyan/white?text=Bottle' }
+            ]);
+
+            const handleSelectProduct = (name) => {
+                setProductName(name);
+                setProductLink(`https://vt.tiktok.com/sample-${name.replace(/\s+/g, '-')}`);
+            };
+
+            // Use useEffect to update sellers based on apiKey
+            useEffect(() => {
+                const fetchRealSellers = async () => {
+                    if (!apiKey) return;
+                    
+                    // Use search to find top selling products on TikTok Shop Thailand
+                    const prompt = `Using Google Search, identify 20 currently trending/best-selling products on TikTok Shop Thailand that are popular for affiliate marketing.
+                    Return a JSON array of objects. Each object must have:
+                    - id: number (1-20)
+                    - name: string (Product name in Thai, concise)
+                    - comm: string (Estimated commission % e.g., "15%")
+                    - sample: boolean (randomly true for most)
+                    - link: string (Use a generic search link format like "https://www.tiktok.com/search?q=[name]")
+                    
+                    Output ONLY the JSON array. No markdown.`;
+                    
+                    try {
+                         const res = await callGeminiAI(apiKey, prompt, true); // Use search
+                         if (res) {
+                             let jsonStr = res.replace(/```json\s*|\s*```/g, '').trim();
+                             const firstBracket = jsonStr.indexOf('[');
+                             const lastBracket = jsonStr.lastIndexOf(']');
+                             if (firstBracket !== -1 && lastBracket !== -1) {
+                                 jsonStr = jsonStr.substring(firstBracket, lastBracket + 1);
+                                 const realData = JSON.parse(jsonStr);
+                                 // Add placeholder images since text-to-image links are hard
+                                 const enrichedData = realData.map(item => ({
+                                     ...item,
+                                     img: `https://placehold.co/100x100?text=${encodeURIComponent(item.name.substring(0,10))}`
+                                 }));
+                                 setSellers(enrichedData);
+                             }
+                         }
+                    } catch (e) {
+                        console.error("Failed to fetch real sellers", e);
+                    }
+                };
+                
+                fetchRealSellers();
+            }, [apiKey]);
+
+            const handleGenerate = async () => {
+                if(!productName) return;
+                setIsGenerating(true);
+                setGeneratedReview(null);
+
+                if (apiKey) {
+                    const prompt = `Act as a professional TikTok Affiliate Creator.
+                    Product: "${productName}".
+                    Tone: "${selectedTone}" (options: Sincere/Funny/Expert).
+                    Language: Thai.
+                    Task: Create a viral review script.
+                    Return JSON format ONLY:
+                    {
+                        "script30s": "Full script text with timestamps [00-05]...",
+                        "pov": "POV concept description",
+                        "hooks": ["Hook 1", "Hook 2", "Hook 3", "Hook 4", "Hook 5"],
+                        "values": ["Value 1", "Value 2", "Value 3"],
+                        "ctas": ["CTA 1", "CTA 2", "CTA 3"]
+                    }`;
+                    
+                    const res = await callGeminiAI(apiKey, prompt);
+                    try {
+                        const jsonStr = res.replace(/```json\s*|\s*```/g, '').trim();
+                        const firstBracket = jsonStr.indexOf('{');
+                        const lastBracket = jsonStr.lastIndexOf('}');
+                        if (firstBracket !== -1 && lastBracket !== -1) {
+                            setGeneratedReview(JSON.parse(jsonStr.substring(firstBracket, lastBracket + 1)));
+                        } else {
+                            throw new Error("Invalid JSON format");
+                        }
+                    } catch(e) {
+                        console.error("JSON Parse Error", e);
+                        setGeneratedReview({ script30s: res, hooks: [], values: [], ctas: [], pov: "Parsing Error: Raw Output Shown" });
+                    }
+                } else {
+                    setTimeout(() => setGeneratedReview({
+                        script30s: `(Mockup ${selectedTone}) เพื่อนๆ! ${productName} ตัวนี้คือดีย์มาก... (เนื้อหาจำลอง)`,
+                        pov: "POV: คนที่เพิ่งเคยลองใช้ครั้งแรก",
+                        hooks: ["หยุดดูเดี๋ยวนี้!", "ไม่ดูถือว่าพลาด", "ของดีบอกต่อ", "คุ้มจนต้องร้องขอชีวิต", "ไอเทมลับ"],
+                        values: ["ใช้งานง่าย", "ราคาประหยัด", "ผลลัพธ์จึ้ง"],
+                        ctas: ["จิ้มตะกร้าเลย", "รีบตำก่อนหมด", "พิกัดหน้าโปรไฟล์"]
+                    }), 1500);
+                }
+                setIsGenerating(false);
+            };
+
+            return (
+                <div className="animate-fade-in max-w-4xl mx-auto pb-10">
+                     <div className="flex items-center mb-8">
+                        <div className="p-3 bg-yellow-100 rounded-lg text-yellow-600 mr-4">
+                            <i className="fa-solid fa-star text-2xl"></i>
+                        </div>
+                        <div>
+                            <h3 className="text-2xl font-bold text-gray-800">AI Review Generator {apiKey && <span className="text-xs bg-green-100 text-green-600 px-2 py-1 rounded ml-2">Real AI</span>}</h3>
+                            <p className="text-gray-500 text-sm">สร้างบทรีวิวป้ายยา สำหรับ Affiliate Creator มืออาชีพ</p>
+                        </div>
+                    </div>
+
+                    <div className="mb-8">
+                        <div className="flex items-center justify-between mb-4">
+                            <h4 className="text-lg font-bold text-gray-800 flex items-center gap-2">
+                                <i className="fa-solid fa-fire text-orange-500"></i> Top 20 Sellers (Free Sample 🎁)
+                            </h4>
+                            <span className="text-xs text-gray-400">อัปเดตวันนี้</span>
+                        </div>
+                        
+                        <div className="flex gap-4 overflow-x-auto pb-6 scrollbar-hide p-2">
+                            {sellers.map((item) => (
+                                <div 
+                                    key={item.id} 
+                                    className="min-w-[160px] bg-white rounded-xl border border-gray-200 p-3 hover:shadow-lg transition group relative flex flex-col"
+                                >
+                                    <div className="absolute top-0 right-0 bg-red-500 text-white text-[10px] px-2 py-1 rounded-bl-lg font-bold z-10 shadow-sm">Free Sample</div>
+                                    <div onClick={() => handleSelectProduct(item.name)} className="h-28 bg-gray-50 rounded-lg mb-3 flex items-center justify-center overflow-hidden cursor-pointer">
+                                        <img src={item.img} alt={item.name} className="w-full h-full object-cover group-hover:scale-110 transition duration-500" />
+                                    </div>
+                                    <h5 className="font-bold text-sm text-gray-800 mb-1 truncate cursor-pointer" onClick={() => handleSelectProduct(item.name)} title={item.name}>{item.name}</h5>
+                                    <div className="flex justify-between items-center mb-2">
+                                        <span className="text-xs text-green-600 font-medium bg-green-50 px-2 py-0.5 rounded">Comm {item.comm}</span>
+                                    </div>
+                                    
+                                    <div className="mt-auto flex flex-col gap-2">
+                                        <a href={item.link} target="_blank" className="w-full bg-indigo-50 text-indigo-600 hover:bg-indigo-100 text-xs font-bold py-2 rounded-lg text-center transition flex items-center justify-center gap-1 border border-indigo-100">
+                                            <i className="fa-solid fa-gift"></i> ขอตัวอย่างฟรี
+                                        </a>
+                                        <button onClick={() => handleSelectProduct(item.name)} className="w-full bg-yellow-400 text-white hover:bg-yellow-500 text-xs font-bold py-2 rounded-lg text-center transition shadow-sm">
+                                            สร้างบทรีวิว
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+
+                    <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-200 mb-8">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                            <div className="md:col-span-2">
+                                <label className="block text-gray-700 text-sm font-bold mb-3"><i className="fa-solid fa-masks-theater mr-1"></i> เลือกสไตล์การรีวิว (Tone)</label>
+                                <div className="flex gap-3">
+                                    {['sincere', 'fun', 'expert'].map(tone => (
+                                        <button 
+                                            key={tone}
+                                            onClick={() => setSelectedTone(tone)}
+                                            className={`flex-1 py-3 rounded-xl text-sm font-bold border transition ${selectedTone === tone ? 'bg-yellow-50 border-yellow-500 text-yellow-700' : 'bg-white text-gray-500 hover:bg-gray-50'}`}
+                                        >
+                                            {tone === 'sincere' ? '😊 จริงใจ' : tone === 'fun' ? '🤣 สนุกสนาน' : '🤓 ผู้เชี่ยวชาญ'}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                            <div>
+                                <label className="block text-gray-700 text-sm font-bold mb-2">ชื่อสินค้า</label>
+                                <input 
+                                    type="text" 
+                                    className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-yellow-400 transition"
+                                    placeholder="เช่น เซรั่ม..."
+                                    value={productName}
+                                    onChange={(e) => setProductName(e.target.value)}
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-gray-700 text-sm font-bold mb-2">ลิงก์สินค้า</label>
+                                <input 
+                                    type="text" 
+                                    className="w-full pl-4 bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-yellow-400 transition"
+                                    placeholder="https://..."
+                                    value={productLink}
+                                    onChange={(e) => setProductLink(e.target.value)}
+                                />
+                            </div>
+                        </div>
+                        <button 
+                            onClick={handleGenerate}
+                            disabled={isGenerating || !productName}
+                            className={`w-full py-4 rounded-xl font-bold text-white shadow-lg transition transform hover:-translate-y-1 ${isGenerating || !productName ? 'bg-gray-300 cursor-not-allowed' : 'bg-gradient-to-r from-yellow-400 to-orange-500 hover:from-yellow-500 hover:to-orange-600'}`}
+                        >
+                            {isGenerating ? (
+                                <span className="flex items-center justify-center gap-2">
+                                    <i className="fas fa-circle-notch fa-spin"></i> กำลังวิเคราะห์สินค้าและสร้างบทพูด...
+                                </span>
+                            ) : (
+                                <span className="flex items-center justify-center gap-2 text-lg">
+                                    <i className="fa-solid fa-wand-magic-sparkles"></i> สร้างบทรีวิว (Magic Script)
+                                </span>
+                            )}
+                        </button>
+                    </div>
+
+                    {generatedReview && (
+                        <div className="space-y-6 animate-fade-in">
+                            <div className="bg-white rounded-2xl border p-6 shadow-sm relative">
+                                <div className="absolute top-4 right-4 flex gap-2">
+                                     <button className="text-gray-400 hover:text-indigo-600 text-sm flex items-center gap-1" onClick={() => downloadTxtFile('review.txt', generatedReview.script30s)}><i className="fa-solid fa-download"></i> Save</button>
+                                     <button className="text-gray-400 hover:text-indigo-600 text-sm flex items-center gap-1" onClick={() => copyToClipboard(generatedReview.script30s)}><i className="far fa-copy"></i> Copy</button>
+                                </div>
+                                <h4 className="font-bold text-yellow-600 mb-3 text-lg flex items-center gap-2"><i className="fa-solid fa-clapperboard"></i> 30s Script ({selectedTone})</h4>
+                                <p className="text-gray-700 whitespace-pre-wrap leading-relaxed font-medium">{generatedReview.script30s}</p>
+                            </div>
+                            
+                             <div className="bg-gray-900 rounded-2xl border border-gray-800 p-6 shadow-lg text-white">
+                                <h4 className="font-bold text-indigo-300 mb-2 text-sm uppercase flex items-center gap-2"><i className="fa-solid fa-video"></i> POV / Concept</h4>
+                                <p className="text-gray-300 font-mono text-sm">{generatedReview.pov}</p>
+                            </div>
+
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                <div className="bg-red-50 p-4 rounded-xl border border-red-100"><h5 className="font-bold text-red-700 mb-2">🎣 5 Hooks</h5><ul className="text-sm text-red-600 space-y-1 pl-4 list-disc">{generatedReview.hooks?.map((h, i) => <li key={i}>{h}</li>)}</ul></div>
+                                <div className="bg-blue-50 p-4 rounded-xl border border-blue-100"><h5 className="font-bold text-blue-700 mb-2">💎 3 Values</h5><ul className="text-sm text-blue-600 space-y-1 pl-4 list-disc">{generatedReview.values?.map((v, i) => <li key={i}>{v}</li>)}</ul></div>
+                                <div className="bg-green-50 p-4 rounded-xl border border-green-100"><h5 className="font-bold text-green-700 mb-2">📣 3 CTAs</h5><ul className="text-sm text-green-600 space-y-1 pl-4 list-disc">{generatedReview.ctas?.map((c, i) => <li key={i}>{c}</li>)}</ul></div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            )
+        };
+
+        // --- Tool 4: Auto-cut (Sim) ---
+        const Tool4_AutoCut = () => {
+            // State for handling video, script, voice selection and export
+            const [videoFile, setVideoFile] = useState(null);
+            const [videoUrl, setVideoUrl] = useState('');
+            const [script, setScript] = useState('');
+            /**
+             * Voice selection:
+             * - original: keep the original audio from the video
+             * - male: use TTS male voice
+             * - female: use TTS female voice
+             * - custom: play recorded/uploaded audio
+             */
+            const [voice, setVoice] = useState('original');
+            // Option to mute the original video track (still mixes silent track if needed)
+            const [muteOriginal, setMuteOriginal] = useState(false);
+            // Preview state to trigger caption overlay
+            const [previewing, setPreviewing] = useState(false);
+            // Array of caption objects with text, highlight flag and active flag
+            const [captions, setCaptions] = useState([]);
+            // Decoded audio from the uploaded video
+            const [audioBuffer, setAudioBuffer] = useState(null);
+            // Optional custom audio recorded or uploaded by the user
+            const [customAudioBuffer, setCustomAudioBuffer] = useState(null);
+            // URL for the recorded/uploaded audio for preview playback
+            const [customAudioUrl, setCustomAudioUrl] = useState('');
+            // Recording state and recorder instance
+            const [isRecording, setIsRecording] = useState(false);
+            const mediaRecorderRef = useRef(null);
+            const [audioChunks, setAudioChunks] = useState([]);
+            // Inserted images/clips for overlay during export
+            const [insertImages, setInsertImages] = useState([]);
+            // Active flags for insert images during preview; set via scheduled timeouts
+            const [activeInserts, setActiveInserts] = useState([]);
+            // Store timeouts so we can clear them when preview ends
+            const insertTimeoutsRef = useRef([]);
+            // Store a reference to the caption interval so it can be cleared on new previews
+            const captionIntervalRef = useRef(null);
+            // Caption font size (base value); user adjustable
+            // Caption font size default to 16px for better fit on 9:16 videos
+            const [captionFontSize, setCaptionFontSize] = useState(16);
+            // Caption vertical position: 'top', 'third' (one third from top), 'middle', 'bottom'
+            // Default caption position is one third from the top for better eye-catching placement
+            // Default caption position set to 'third' (one-third from top)
+            const [captionPosition, setCaptionPosition] = useState('third');
+            // Maximum characters per line for caption wrapping
+            // Default maximum characters per line for caption wrapping
+            const [maxCharsPerLine, setMaxCharsPerLine] = useState(20);
+
+            // Maximum words per caption segment. The script will be split into segments of N words,
+            // where each segment will be treated as a single caption. This helps prevent long
+            // captions from overflowing and allows multi-line export. Default is 4 words per caption.
+            const [maxWordsPerLine, setMaxWordsPerLine] = useState(4);
+            // Duration of the audio/video
+            const [duration, setDuration] = useState(0);
+            // Flag to indicate export in progress
+            const [exporting, setExporting] = useState(false);
+            const videoRef = useRef(null);
+            const canvasRef = useRef(null);
+
+            // Hook detection: start time (seconds) and duration (seconds) for auto zoom effect
+            // Default: start at 0s and last 3s; will be updated via detectHook
+            const [hookStart, setHookStart] = useState(0);
+            const [hookDuration, setHookDuration] = useState(3);
+            // Keep track of timeouts used for scheduling hook zoom in preview
+            const hookTimeoutsRef = useRef([]);
+
+            // Handle video upload and decode its audio for mixing
+            const handleVideoUpload = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                setVideoFile(file);
+                const url = URL.createObjectURL(file);
+                setVideoUrl(url);
+                // Decode audio from the file to get duration and buffer
+                const arrayBuffer = await file.arrayBuffer();
+                try {
+                    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    const buffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+                    setAudioBuffer(buffer);
+                    setDuration(buffer.duration);
+                } catch (err) {
+                    console.warn('Failed to decode audio', err);
+                    setAudioBuffer(null);
+                    setDuration(0);
+                }
+            };
+
+            // Handle audio upload to be used instead of original audio
+            const handleAudioUpload = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const arrayBuffer = await file.arrayBuffer();
+                try {
+                    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    const buffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+                    setCustomAudioBuffer(buffer);
+                    setCustomAudioUrl(URL.createObjectURL(file));
+                } catch (err) {
+                    console.warn('Failed to decode custom audio', err);
+                }
+            };
+
+            // Start recording audio via microphone
+            const startRecording = async () => {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    const recorder = new MediaRecorder(stream);
+                    mediaRecorderRef.current = recorder;
+                    setAudioChunks([]);
+                    recorder.ondataavailable = (e) => {
+                        if (e.data.size > 0) {
+                            setAudioChunks((prev) => [...prev, e.data]);
+                        }
+                    };
+                    recorder.onstop = async () => {
+                        const blob = new Blob(audioChunks, { type: 'audio/webm' });
+                        const url = URL.createObjectURL(blob);
+                        setCustomAudioUrl(url);
+                        // Decode recorded audio
+                        const arrayBuffer = await blob.arrayBuffer();
+                        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                        try {
+                            const buffer = await audioCtx.decodeAudioData(arrayBuffer);
+                            setCustomAudioBuffer(buffer);
+                        } catch (err) {
+                            console.warn('Failed to decode recorded audio', err);
+                        }
+                    };
+                    recorder.start();
+                    setIsRecording(true);
+                } catch (err) {
+                    console.warn('Cannot start recording', err);
+                    alert('ไม่สามารถเข้าถึงไมโครโฟนได้');
+                }
+            };
+
+            // Stop recording audio
+            const stopRecording = () => {
+                const recorder = mediaRecorderRef.current;
+                if (recorder && recorder.state !== 'inactive') {
+                    recorder.stop();
+                    setIsRecording(false);
+                }
+            };
+
+            // Add an insert image with start time and optional duration
+            const handleInsertImage = (e, start, dur, position) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const url = URL.createObjectURL(file);
+                const img = new Image();
+                img.src = url;
+                // Use provided duration or fallback to 3 seconds
+                const duration = parseFloat(dur) || 3;
+                const pos = position || 'center';
+                img.onload = () => {
+                    setInsertImages(prev => [...prev, { image: img, url, start: parseFloat(start) || 0, duration, position: pos, type: file.type.startsWith('video') ? 'video' : 'image' }]);
+                };
+            };
+
+            // Detect hook automatically based on the provided script. This function sets
+            // the start and duration of the hook segment, which will be used to
+            // schedule a zoom effect during preview and export. Currently, it uses a
+            // simple heuristic: assume the hook occurs at the beginning of the
+            // video and lasts for a few seconds proportionate to the script length.
+            const detectHook = async () => {
+                if (!script || script.trim().length === 0) {
+                    alert('กรุณาใส่สคริปต์เพื่อวิเคราะห์ Hook');
+                    return;
+                }
+                // Split script into words to estimate speaking time. Average Thai speaking
+                // rate is roughly 2.5 words/second. We'll assume the hook lasts
+                // 30% of the total reading time, bounded between 3 and 5 seconds.
+                const words = script.split(/\s+/).filter(Boolean);
+                const estimatedTotalSeconds = words.length / 2.5;
+                let newHookDuration = estimatedTotalSeconds * 0.3;
+                if (newHookDuration < 3) newHookDuration = 3;
+                if (newHookDuration > 5) newHookDuration = 5;
+                setHookStart(0);
+                setHookDuration(newHookDuration);
+                // Highlight the first caption segment as hook
+                setCaptions(prev => prev.map((c, i) => ({ ...c, highlight: i === 0 })));
+                alert('ตั้งค่า Hook อัตโนมัติเรียบร้อย! ระบบจะซูมช่วงต้นของวิดีโอ');
+            };
+
+            // Detect hook using Gemini AI via the existing callGeminiAI function. It will
+            // parse the returned JSON to determine hookStart and hookDuration.
+            const detectHookAI = async () => {
+                // Use serverless function to analyse the hook
+                if (!script || script.trim().length === 0) {
+                    alert('กรุณาใส่สคริปต์เพื่อวิเคราะห์ Hook');
+                    return;
+                }
+                try {
+                    const response = await fetch('/.netlify/functions/geminiHook', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ script: script, maxDuration: 5 })
+                    });
+                    const text = await response.text();
+                    let parsed;
+                    try {
+                        parsed = JSON.parse(text);
+                    } catch (jsonErr) {
+                        // fallback: try to extract numbers manually from plain text
+                        const startMatch = text.match(/"?hookStart"?\s*:?\s*(\d+(\.\d+)?)/);
+                        const durMatch = text.match(/"?hookDuration"?\s*:?\s*(\d+(\.\d+)?)/);
+                        if (startMatch && durMatch) {
+                            parsed = { hookStart: parseFloat(startMatch[1]), hookDuration: parseFloat(durMatch[1]) };
+                        }
+                    }
+                    if (parsed && typeof parsed.hookStart === 'number' && typeof parsed.hookDuration === 'number') {
+                        setHookStart(parsed.hookStart);
+                        setHookDuration(parsed.hookDuration);
+                        setCaptions(prev => prev.map((c, i) => ({ ...c, highlight: i === 0 })));
+                        alert('วิเคราะห์ Hook ด้วย AI เสร็จสิ้น!');
+                    } else {
+                        await detectHook();
+                    }
+                } catch (err) {
+                    console.error('AI hook detection failed:', err);
+                    await detectHook();
+                }
+            };
+
+            // Prepare captions and play preview with optional TTS or custom audio
+            const handlePreview = () => {
+                // Must have a video selected. Script can be empty.
+                if (!videoUrl) return;
+                setPreviewing(true);
+                // Clear previous caption interval to avoid overlapping timers
+                if (captionIntervalRef.current) {
+                    clearInterval(captionIntervalRef.current);
+                    captionIntervalRef.current = null;
+                }
+                // Clear any scheduled hook zoom timeouts from previous previews
+                if (hookTimeoutsRef.current && hookTimeoutsRef.current.length) {
+                    hookTimeoutsRef.current.forEach(t => clearTimeout(t));
+                    hookTimeoutsRef.current = [];
+                }
+                const words = script.split(/\s+/).filter(Boolean);
+                // Determine keywords (top 3 longest words) to highlight
+                const sorted = [...words].sort((a, b) => b.length - a.length);
+                const keywords = sorted.slice(0, Math.min(3, sorted.length));
+                // Break into segments by number of words per caption
+                const segments = [];
+                for (let i = 0; i < words.length; i += maxWordsPerLine) {
+                    segments.push(words.slice(i, i + maxWordsPerLine));
+                }
+                const captionData = segments.map(segment => ({
+                    text: segment.join(' '),
+                    words: segment,
+                    highlight: segment.some(w => keywords.includes(w)),
+                    highlightWords: segment.map(w => keywords.includes(w)),
+                    active: false
+                }));
+                setCaptions(captionData);
+
+                // Note: insert image scheduling will be handled later in this function after caption timing
+
+                // Play the video from the start
+                const vid = videoRef.current;
+                vid.currentTime = 0;
+                vid.play();
+                // Speak using TTS or play custom audio based on selection
+                if (voice === 'male' || voice === 'female') {
+                    if ('speechSynthesis' in window) {
+                        const utter = new SpeechSynthesisUtterance(script);
+                        const available = speechSynthesis.getVoices();
+                        // Find Thai voices first
+                        const thaiVoices = available.filter(v => v.lang && v.lang.toLowerCase().startsWith('th'));
+                        let selected;
+                        if (voice === 'male') {
+                            // look for male voice among Thai voices
+                            selected = thaiVoices.find(v => {
+                                const name = v.name.toLowerCase();
+                                return name.includes('male') || name.includes('ชาย');
+                            });
+                            if (!selected) {
+                                // fallback to any Thai voice if exists
+                                selected = thaiVoices[0];
+                            }
+                        } else if (voice === 'female') {
+                            selected = thaiVoices.find(v => {
+                                const name = v.name.toLowerCase();
+                                return name.includes('female') || name.includes('หญิง');
+                            });
+                            if (!selected) {
+                                selected = thaiVoices[0];
+                            }
+                        }
+                        if (selected) utter.voice = selected;
+                        // Cancel any ongoing speech and speak
+                        speechSynthesis.cancel();
+                        speechSynthesis.speak(utter);
+                    }
+                } else if (voice === 'custom' && customAudioUrl) {
+                    // Play custom audio file for preview
+                    const audioElem = new Audio(customAudioUrl);
+                    audioElem.play();
+                }
+                // Zoom animation for hook effect: schedule based on hookStart and hookDuration
+                const container = document.getElementById('video-container');
+                if (container && hookDuration > 0) {
+                    const showTimeout = setTimeout(() => {
+                        container.classList.add('zoom-animation');
+                    }, hookStart * 1000);
+                    const hideTimeout = setTimeout(() => {
+                        container.classList.remove('zoom-animation');
+                    }, (hookStart + hookDuration) * 1000);
+                    hookTimeoutsRef.current = [showTimeout, hideTimeout];
+                }
+                // Caption timing
+                const totalDuration = vid.duration || duration || 10;
+                // Schedule caption activation only if there are caption segments
+                if (captionData.length > 0) {
+                    let idx = 0;
+                    setCaptions(prev => prev.map((c, i) => ({ ...c, active: i === 0 })));
+                    // Determine interval based on total duration and number of captions
+                    const intervalMs = (totalDuration * 1000) / captionData.length;
+                    captionIntervalRef.current = setInterval(() => {
+                        idx++;
+                        if (idx >= captionData.length) {
+                            clearInterval(captionIntervalRef.current);
+                            captionIntervalRef.current = null;
+                            return;
+                        }
+                        setCaptions(prev => prev.map((c, i) => ({ ...c, active: i === idx })));
+                    }, intervalMs);
+                } else {
+                    // No captions: ensure all caption segments inactive
+                    setCaptions(prev => prev.map(c => ({ ...c, active: false })));
+                }
+
+                // Prepare insert image preview: reset active flags and schedule timeouts
+                // Clear previous timeouts and schedule new insert overlays
+                insertTimeoutsRef.current.forEach(t => clearTimeout(t));
+                insertTimeoutsRef.current = [];
+                setActiveInserts(Array(insertImages.length).fill(false));
+                insertImages.forEach((item, index) => {
+                    // Activate insert at its start time
+                    const onTime = setTimeout(() => {
+                        setActiveInserts(prev => prev.map((v, i) => (i === index ? true : v)));
+                    }, (parseFloat(item.start) || 0) * 1000);
+                    // Deactivate after its duration
+                    const offTime = setTimeout(() => {
+                        setActiveInserts(prev => prev.map((v, i) => (i === index ? false : v)));
+                    }, ((parseFloat(item.start) || 0) + (parseFloat(item.duration) || 0)) * 1000);
+                    insertTimeoutsRef.current.push(onTime, offTime);
+                });
+            };
+
+            // Export the video with overlay and mixed audio
+            const handleExport = async () => {
+                // Must have a video selected
+                if (!videoUrl) return;
+                setExporting(true);
+                const video = videoRef.current;
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                // Ensure canvas matches video size
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                // Setup audio context for mixing
+                const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const dest = audioCtx.createMediaStreamDestination();
+                // Ensure the audio context is running (it may start in a suspended state)
+                if (audioCtx.state === 'suspended') {
+                    try {
+                        await audioCtx.resume();
+                    } catch (err) {
+                        console.warn('Failed to resume audio context', err);
+                    }
+                }
+                // Decide which audio buffers to include
+                // Original audio
+                if (!muteOriginal && audioBuffer) {
+                    const source = audioCtx.createBufferSource();
+                    source.buffer = audioBuffer;
+                    // Connect to the MediaStreamDestination and to the AudioContext destination so it can be heard while recording
+                    source.connect(dest);
+                    source.connect(audioCtx.destination);
+                    source.start();
+                } else {
+                    // Provide a silent track if original audio is muted or missing
+                    const silenceDuration = duration || video.duration || 10;
+                    const silentBuffer = audioCtx.createBuffer(1, Math.ceil(audioCtx.sampleRate * silenceDuration), audioCtx.sampleRate);
+                    const silentSource = audioCtx.createBufferSource();
+                    silentSource.buffer = silentBuffer;
+                    silentSource.connect(dest);
+                    silentSource.start();
+                }
+                // Custom audio overlay: play if selected and available
+                if (voice === 'custom' && customAudioBuffer) {
+                    const customSource = audioCtx.createBufferSource();
+                    customSource.buffer = customAudioBuffer;
+                    // Connect custom audio to the MediaStreamDestination and to the audio context output
+                    customSource.connect(dest);
+                    customSource.connect(audioCtx.destination);
+                    customSource.start();
+                }
+                // Capture canvas frames and combine with audio
+                const canvasStream = canvas.captureStream(25);
+                const combined = new MediaStream([...canvasStream.getVideoTracks(), ...dest.stream.getAudioTracks()]);
+                // Prefer MP4 if supported; otherwise fallback to WebM
+                const mimeType = MediaRecorder.isTypeSupported('video/mp4') ? 'video/mp4' : 'video/webm';
+                const recorder = new MediaRecorder(combined, { mimeType });
+                const chunks = [];
+                recorder.ondataavailable = (e) => {
+                    if (e.data.size > 0) chunks.push(e.data);
+                };
+                recorder.onstop = async () => {
+                    // Assemble recorded data into a blob
+                    const blob = new Blob(chunks, { type: mimeType });
+                    let finalBlob = blob;
+                    let finalExt = mimeType === 'video/mp4' ? 'mp4' : 'webm';
+                    // If not MP4, attempt to convert to MP4 using ffmpeg.wasm
+                    if (mimeType !== 'video/mp4') {
+                        try {
+                            const { createFFmpeg } = FFmpeg;
+                            const ffmpeg = createFFmpeg({ log: false });
+                            await ffmpeg.load();
+                            // Write input file to virtual FS
+                            const buffer = new Uint8Array(await blob.arrayBuffer());
+                            ffmpeg.FS('writeFile', 'input.webm', buffer);
+                            // Run conversion: copy video stream and encode audio to AAC
+                            await ffmpeg.run('-i', 'input.webm', '-c:v', 'copy', '-c:a', 'aac', 'output.mp4');
+                            // Read the converted file
+                            const data = ffmpeg.FS('readFile', 'output.mp4');
+                            finalBlob = new Blob([data.buffer], { type: 'video/mp4' });
+                            finalExt = 'mp4';
+                        } catch (err) {
+                            console.error('MP4 conversion failed:', err);
+                        }
+                    }
+                    const url = URL.createObjectURL(finalBlob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = `auto_cut_export.${finalExt}`;
+                    link.click();
+                    // Log the export event with the chosen extension
+                    try {
+                        fetch('/.netlify/functions/logUsage', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ event: 'export', ext: finalExt, timestamp: new Date().toISOString() })
+                        });
+                    } catch (logErr) {
+                        console.warn('Usage logging failed', logErr);
+                    }
+                    setExporting(false);
+                };
+                recorder.start();
+                // Draw frames with caption and insert images
+                const totalDuration = video.duration || duration || 10;
+                const captionData = captions;
+                let idx = 0;
+                const drawFrame = () => {
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    // Draw base video frame with optional zoom during hook segment
+                    // Calculate zoom factor based on hookStart and hookDuration
+                    let scale = 1;
+                    if (hookDuration > 0 && currentTime >= hookStart && currentTime < hookStart + hookDuration) {
+                        // Progress ratio between 0 and 1
+                        const progress = (currentTime - hookStart) / hookDuration;
+                        // Gradually zoom from 1 to 1.1 (10% zoom)
+                        scale = 1 + 0.1 * progress;
+                    }
+                    // Calculate scaled dimensions and offsets to keep video centered
+                    const scaledW = canvas.width * scale;
+                    const scaledH = canvas.height * scale;
+                    const offsetX = -(scaledW - canvas.width) / 2;
+                    const offsetY = -(scaledH - canvas.height) / 2;
+                    ctx.drawImage(video, offsetX, offsetY, scaledW, scaledH);
+                    // Draw insert images if within their time window
+                    const currentTime = video.currentTime;
+                    insertImages.forEach(({ image, start, duration: dur, position }) => {
+                        if (currentTime >= start && currentTime < start + dur) {
+                            // Determine position and size: left/right -> half width; center -> full
+                            let drawX = 0;
+                            let drawW = canvas.width;
+                            if (position === 'left') {
+                                drawW = canvas.width / 2;
+                                drawX = 0;
+                            } else if (position === 'right') {
+                                drawW = canvas.width / 2;
+                                drawX = canvas.width / 2;
+                            } else {
+                                drawW = canvas.width;
+                                drawX = 0;
+                            }
+                            ctx.drawImage(image, drawX, 0, drawW, canvas.height);
+                        }
+                    });
+                    // Draw caption text if exists
+                    if (captionData.length > 0) {
+                        const current = captionData[idx];
+                        const baseSize = captionFontSize;
+                        const size = current.highlight ? baseSize * 1.3 : baseSize;
+                        ctx.font = `${current.highlight ? 'bold ' : ''}${size}px Prompt, sans-serif`;
+                        ctx.textAlign = 'center';
+                        ctx.lineWidth = 4;
+                        ctx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
+                        ctx.fillStyle = current.highlight ? '#FBBF24' : '#FFFFFF';
+                        // Break text into lines based on maxCharsPerLine first
+                        const words = current.text.split(' ');
+                        const charLimit = maxCharsPerLine || 30;
+                        const tempLines = [];
+                        let tempLine = '';
+                        for (let i = 0; i < words.length; i++) {
+                            const next = tempLine + (tempLine ? ' ' : '') + words[i];
+                            if (next.length > charLimit && tempLine) {
+                                tempLines.push(tempLine);
+                                tempLine = words[i];
+                            } else {
+                                tempLine = next;
+                            }
+                        }
+                        if (tempLine) tempLines.push(tempLine);
+                        // Further wrap based on width constraint
+                        const maxWidth = canvas.width * 0.9;
+                        const lines = [];
+                        tempLines.forEach(temp => {
+                            let line = '';
+                            temp.split(' ').forEach(word => {
+                                const testLine = line + (line ? ' ' : '') + word;
+                                const metrics = ctx.measureText(testLine);
+                                if (metrics.width > maxWidth && line) {
+                                    lines.push(line);
+                                    line = word;
+                                } else {
+                                    line = testLine;
+                                }
+                            });
+                            if (line) lines.push(line);
+                        });
+                        // Determine base y-position based on captionPosition
+                        let baseY;
+                        const lineHeight = size + 10;
+                        if (captionPosition === 'top') {
+                            // Place captions near top
+                            baseY = 50;
+                        } else if (captionPosition === 'middle') {
+                            // Center captions vertically
+                            baseY = canvas.height / 2 - ((lines.length - 1) / 2) * lineHeight;
+                        } else if (captionPosition === 'third') {
+                            // Place captions around one-third from the top
+                            baseY = canvas.height / 3 - ((lines.length - 1) / 2) * lineHeight;
+                        } else {
+                            // bottom
+                            baseY = canvas.height - 50 - (lines.length - 1) * lineHeight;
+                        }
+                        lines.forEach((ln, idxLine) => {
+                            const yPos = baseY + idxLine * lineHeight;
+                            ctx.strokeText(ln, canvas.width / 2, yPos);
+                            ctx.fillText(ln, canvas.width / 2, yPos);
+                        });
+                    }
+                    // Update caption index based on current time
+                    idx = Math.min(Math.floor(video.currentTime / (totalDuration / captionData.length)), captionData.length - 1);
+                    if (!video.paused && !video.ended) {
+                        requestAnimationFrame(drawFrame);
+                    }
+                };
+                video.currentTime = 0;
+                video.play();
+                drawFrame();
+                video.onended = () => {
+                    recorder.stop();
+                };
+            };
+
+            return (
+                <div className="animate-fade-in max-w-4xl mx-auto">
+                    <div className="bg-white p-6 rounded-2xl shadow-sm border space-y-4">
+                        <h3 className="text-2xl font-bold text-gray-800 mb-4">AI Auto-cut</h3>
+                        <div>
+                            <label className="block mb-2 font-medium">1. เลือกไฟล์วิดีโอ</label>
+                            <input type="file" accept="video/*" onChange={handleVideoUpload} className="mb-4" />
+                        </div>
+                        <div>
+                            <label className="block mb-2 font-medium">2. ใส่สคริปต์/ข้อความ</label>
+                            <textarea value={script} onChange={e => setScript(e.target.value)} className="w-full border p-2 rounded-md" rows="3" placeholder="ใส่ข้อความที่จะใช้เป็นคำบรรยาย"></textarea>
+                            {/* Adjust caption settings */}
+                            <div className="flex flex-wrap items-center gap-4 mt-2">
+                                <div className="flex items-center gap-2">
+                                    <label className="font-medium">ขนาดตัวอักษร:</label>
+                                    <input type="number" value={captionFontSize} onChange={e => setCaptionFontSize(Number(e.target.value))} min="12" max="80" step="2" className="border p-1 w-24 rounded-md" />
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <label className="font-medium">ตำแหน่งคำบรรยาย:</label>
+                                    <select value={captionPosition} onChange={e => setCaptionPosition(e.target.value)} className="border p-1 rounded-md">
+                                        <option value="top">ด้านบน</option>
+                                        <option value="middle">ตรงกลาง</option>
+                                        <option value="third">1/3 จากด้านบน</option>
+                                        <option value="bottom">ด้านล่าง</option>
+                                    </select>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <label className="font-medium">อักษรต่อบรรทัด:</label>
+                                    <input type="number" value={maxCharsPerLine} onChange={e => setMaxCharsPerLine(Number(e.target.value))} min="10" max="100" step="5" className="border p-1 w-24 rounded-md" />
+                                </div>
+
+                                <div className="flex items-center gap-2">
+                                    <label className="font-medium">คำต่อแคปชั่น:</label>
+                                    <input type="number" value={maxWordsPerLine} onChange={e => setMaxWordsPerLine(Number(e.target.value))} min="1" max="20" step="1" className="border p-1 w-24 rounded-md" />
+                                </div>
+                                {/* Auto Hook detection button */}
+                                <div className="flex items-center gap-2 mt-2">
+                                    <button onClick={detectHook} className="bg-yellow-500 hover:bg-yellow-600 text-white px-3 py-1 rounded-md">
+                                        วิเคราะห์ Hook อัตโนมัติ
+                                    </button>
+                                    <span className="text-sm text-gray-600">ระบบจะซูมช่วงต้นของวิดีโอ</span>
+                                    {/* AI-based hook detection using Gemini if API key is provided */}
+                                    <button onClick={detectHookAI} className="ml-2 bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded-md">
+                                        วิเคราะห์ Hook (AI)
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                        <div className="flex flex-col gap-2 mt-2">
+                            <div className="flex items-center gap-4">
+                                <label className="font-medium">เสียง:</label>
+                                <select value={voice} onChange={e => setVoice(e.target.value)} className="border p-2 rounded-md">
+                                    <option value="original">ใช้เสียงต้นฉบับ</option>
+                                    <option value="male">เสียงผู้ชาย (TTS)</option>
+                                    <option value="female">เสียงผู้หญิง (TTS)</option>
+                                    <option value="custom">เสียงที่บันทึก/อัปโหลด</option>
+                                </select>
+                                <label className="flex items-center gap-2 ml-4">
+                                    <input type="checkbox" checked={muteOriginal} onChange={e => setMuteOriginal(e.target.checked)} />
+                                    <span>ปิดเสียงต้นฉบับ</span>
+                                </label>
+                            </div>
+                            {/* External TTS hint for users who want to generate voice outside */}
+                            <div className="text-sm text-blue-600 mt-1">
+                                <a href="https://crikk.com/text-to-speech/thai/" target="_blank" rel="noopener noreferrer">
+                                    สร้างเสียงภายนอกฟรี (Crikk Thai TTS)
+                                </a>
+                            </div>
+                            {/* Audio recording and upload controls */}
+                            {voice === 'custom' && (
+                                <div className="flex items-center gap-4 mt-2">
+                                    <button onClick={isRecording ? stopRecording : startRecording} className={`px-3 py-1 rounded-md ${isRecording ? 'bg-red-600 text-white' : 'bg-purple-600 text-white'}`}>{isRecording ? 'หยุดบันทึกเสียง' : 'บันทึกเสียง'}</button>
+                                    <input type="file" accept="audio/*" onChange={handleAudioUpload} className="" />
+                                    {customAudioUrl && <audio controls src={customAudioUrl} className="w-32"></audio>}
+                                </div>
+                            )}
+                        </div>
+                        {/* Section to add insert images or clips */}
+                        <div className="mt-4">
+                            <label className="block font-medium mb-1">เพิ่มภาพ/คลิปย่อย (Insert)</label>
+                            <div className="flex flex-wrap gap-2 mb-2 items-center">
+                                <input type="file" accept="image/*,video/*" onChange={e => {
+                                    const startInput = document.getElementById('insert-start-time');
+                                    const durInput = document.getElementById('insert-duration');
+                                    const posSelect = document.getElementById('insert-position');
+                                    const startTime = startInput ? startInput.value : '0';
+                                    const dur = durInput ? durInput.value : '3';
+                                    const pos = posSelect ? posSelect.value : 'center';
+                                    handleInsertImage(e, startTime, dur, pos);
+                                    // reset file input value to allow re-upload same file
+                                    e.target.value = '';
+                                }} />
+                                <input id="insert-start-time" type="number" min="0" step="0.5" placeholder="เวลาเริ่ม (วินาที)" className="border p-1 w-24 rounded-md" />
+                                <input id="insert-duration" type="number" min="0.5" step="0.5" placeholder="ระยะเวลา (วินาที)" className="border p-1 w-28 rounded-md" />
+                                <select id="insert-position" className="border p-1 rounded-md">
+                                    <option value="center">กลาง</option>
+                                    <option value="left">ซ้าย</option>
+                                    <option value="right">ขวา</option>
+                                </select>
+                            </div>
+                            {insertImages.length > 0 && (
+                                <div className="space-y-1">
+                                    {insertImages.map((item, idx) => (
+                                        <div key={idx} className="text-sm flex items-center gap-2">
+                                            <span>Insert {idx + 1}: เริ่ม {item.start}s, {item.duration}s, {item.position}</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                        <div className="flex gap-4 mt-4">
+                            <button onClick={handlePreview} className="bg-blue-600 text-white px-4 py-2 rounded-md">Preview</button>
+                            <button onClick={handleExport} disabled={exporting} className={`px-4 py-2 rounded-md ${exporting ? 'bg-gray-400 text-gray-700' : 'bg-green-600 text-white'}`}>{exporting ? 'Exporting...' : 'Export Video'}</button>
+                        </div>
+                        <div className="mt-6 relative" id="video-container">
+                            {videoUrl ? (
+                                <>
+                                    <video ref={videoRef} src={videoUrl} controls className="w-full rounded-lg border" style={{ maxHeight: '360px' }} />
+                                    {/* Hidden canvas for export */}
+                                    <canvas ref={canvasRef} style={{ display: 'none' }}></canvas>
+                                    {/* Overlay insert media during preview */}
+                                    {previewing && insertImages.map((item, i) => (
+                                        activeInserts[i] ? (
+                                            item.type === 'image' ? (
+                                                <img key={`insert-${i}`} src={item.url} alt="insert" style={{
+                                                    position: 'absolute',
+                                                    top: 0,
+                                                    left: item.position === 'left' ? 0 : item.position === 'right' ? '50%' : 0,
+                                                    width: item.position === 'center' ? '100%' : '50%',
+                                                    height: '100%',
+                                                    objectFit: 'cover',
+                                                    pointerEvents: 'none',
+                                                }} />
+                                            ) : (
+                                                <video key={`insert-${i}`} src={item.url} autoPlay muted loop style={{
+                                                    position: 'absolute',
+                                                    top: 0,
+                                                    left: item.position === 'left' ? 0 : item.position === 'right' ? '50%' : 0,
+                                                    width: item.position === 'center' ? '100%' : '50%',
+                                                    height: '100%',
+                                                    objectFit: 'cover',
+                                                    pointerEvents: 'none',
+                                                }} />
+                                            )
+                                        ) : null
+                                    ))}
+                                    {/* Overlay captions for preview */}
+                                    {previewing && captions.map((c, i) => (
+                                    <span
+                                            key={i}
+                                            className="absolute left-1/2 transform -translate-x-1/2 px-2 py-1 rounded-md"
+                                            style={{
+                                                transition: 'all 0.3s ease',
+                                                opacity: c.active ? 1 : 0,
+                                                // Adjust translate for middle position
+                                                transform:
+                                                    captionPosition === 'middle'
+                                                        ? c.active
+                                                            ? 'translate(-50%, -50%)'
+                                                            : 'translate(-50%, -40%)'
+                                                        : captionPosition === 'third'
+                                                        ? c.active
+                                                            ? 'translate(-50%, -33%)'
+                                                            : 'translate(-50%, -23%)'
+                                                        : c.active
+                                                        ? 'translate(-50%, 0)'
+                                                        : 'translate(-50%, 20px)',
+                                                backgroundColor: 'rgba(0,0,0,0.6)',
+                                                maxWidth: '90%',
+                                                overflowWrap: 'break-word',
+                                                wordBreak: 'break-word',
+                                                whiteSpace: 'normal',
+                                                padding: '4px 8px',
+                                                fontSize: `${captionFontSize}px`,
+                                                // Positioning: top, middle, bottom
+                                                bottom: captionPosition === 'bottom' ? '4%' : 'auto',
+                                                top:
+                                                    captionPosition === 'top'
+                                                        ? '4%'
+                                                        : captionPosition === 'middle'
+                                                        ? '50%'
+                                                        : captionPosition === 'third'
+                                                        ? '33%'
+                                                        : 'auto'
+                                            }}
+                                        >
+                                            {c.words && c.words.map((word, wIdx) => (
+                                                <span key={wIdx} className={c.highlightWords && c.highlightWords[wIdx] ? 'font-bold text-yellow-400' : 'text-white'}>
+                                                    {word}{' '}
+                                                </span>
+                                            ))}
+                                        </span>
+                                    ))}
+                                </>
+                            ) : (
+                                <div className="text-center text-gray-400 border border-dashed rounded-lg p-6">ยังไม่ได้เลือกวิดีโอ</div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- Tool 5: AI Image Gen (Backend Prompt Builder) ---
+        const Tool5_AIImageGen = ({ apiKey }) => {
+            const [style, setStyle] = useState('product');
+            const [aspect, setAspect] = useState('9:16');
+            const [platform, setPlatform] = useState('tiktok');
+            const [extra, setExtra] = useState('no text on image, clean background');
+            const [thaiDesc, setThaiDesc] = useState('');
+            const [resultPrompt, setResultPrompt] = useState('');
+            const [isGenerating, setIsGenerating] = useState(false);
+
+            const handleGenerate = async () => {
+                if (!thaiDesc.trim()) return;
+                setIsGenerating(true);
+
+                const baseAspect =
+                    aspect === '9:16'
+                        ? 'vertical 9:16 for TikTok/Reels'
+                        : aspect === '1:1'
+                        ? 'square 1:1 for feed post'
+                        : 'horizontal 16:9';
+
+                const styleText =
+                    style === 'product'
+                        ? 'cinematic product photo, ecommerce, studio lighting'
+                        : style === 'review'
+                        ? 'lifestyle review scene, natural light, human holding product'
+                        : style === 'thumbnail'
+                        ? 'YouTube/TikTok style thumbnail, high contrast, strong composition'
+                        : 'storytelling cinematic scene, emotional lighting';
+
+                const platformText =
+                    platform === 'tiktok'
+                        ? 'optimized for TikTok vertical video cover'
+                        : platform === 'facebook'
+                        ? 'optimized for Facebook/Instagram post'
+                        : 'optimized for general social media';
+
+                const fallbackPrompt = `
+${styleText}, ${baseAspect},
+${platformText},
+main idea: ${thaiDesc},
+${extra},
+ultra sharp, high detail, soft lighting, realistic, trending on social media
+`.trim();
+
+                try {
+                    const prompt = `You are an expert AI image prompt engineer.
+
+Convert the following Thai description into ONE concise English prompt for a text-to-image model (Gemini, Midjourney, DALL-E).
+
+Thai description: '${thaiDesc}'
+
+Use this information:
+- Style: ${styleText}
+- Aspect ratio / framing: ${baseAspect}
+- Platform: ${platformText}
+- Extra constraints (in English): ${extra}
+
+Rules:
+- Return ONLY the final English prompt.
+- Do NOT include Thai in the final prompt.
+- Do NOT include bullets, numbering, JSON or markdown.
+- Do NOT wrap it in quotes.
+The prompt should already be ready to paste into an AI image generator.`.trim();
+
+                    const res = await callGeminiAI(apiKey || 'BACKEND_MODE', prompt, false);
+                    let finalPrompt = '';
+
+                    if (res) {
+                        finalPrompt = res
+                            .replace(/```.*?```/gs, '')
+                            .replace(/^"+|"+$/g, '')
+                            .trim();
+                    }
+
+                    setResultPrompt(finalPrompt || fallbackPrompt);
+                } catch (error) {
+                    console.error('AI Image Gen error:', error);
+                    setResultPrompt(fallbackPrompt);
+                } finally {
+                    setIsGenerating(false);
+                }
+            };
+
+            const handleCopy = () => {
+                if (!resultPrompt) return;
+                copyToClipboard(resultPrompt);
+                alert('คัดลอก Prompt เรียบร้อย นำไปวางใน Gemini / Midjourney ได้เลยครับ');
+            };
+
+            return (
+                <div className="space-y-6 animate-fade-in max-w-3xl mx-auto">
+                    <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
+                        <h2 className="text-xl font-bold text-gray-900 flex items-center gap-2">
+                            <i className="fa-regular fa-image text-green-500"></i>
+                            AI Image Gen (Prompt Builder)
+                            {apiKey && (
+                                <span className="ml-2 text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full border border-green-200">
+                                    ใช้ AI ช่วยเขียน Prompt
+                                </span>
+                            )}
+                        </h2>
+                        <p className="text-sm text-gray-500 mt-1">
+                            เขียนคำบรรยายภาษาไทยให้ AI แปลงเป็น Prompt ภาษาอังกฤษสำหรับ Gemini / Midjourney / DALL·E
+                        </p>
+                    </div>
+
+                    <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 space-y-5">
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div>
+                                <label className="text-xs font-semibold text-gray-600 block mb-1">ประเภทภาพ (Style)</label>
+                                <select
+                                    value={style}
+                                    onChange={e => setStyle(e.target.value)}
+                                    className="w-full border-gray-300 rounded-lg text-sm"
+                                >
+                                    <option value="product">Product Shot</option>
+                                    <option value="review">Review / Lifestyle</option>
+                                    <option value="thumbnail">Thumbnail</option>
+                                    <option value="story">Storytelling</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label className="text-xs font-semibold text-gray-600 block mb-1">อัตราส่วน (Aspect Ratio)</label>
+                                <select
+                                    value={aspect}
+                                    onChange={e => setAspect(e.target.value)}
+                                    className="w-full border-gray-300 rounded-lg text-sm"
+                                >
+                                    <option value="9:16">9:16 (Vertical)</option>
+                                    <option value="1:1">1:1 (Square)</option>
+                                    <option value="16:9">16:9 (Horizontal)</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label className="text-xs font-semibold text-gray-600 block mb-1">แพลตฟอร์ม</label>
+                                <select
+                                    value={platform}
+                                    onChange={e => setPlatform(e.target.value)}
+                                    className="w-full border-gray-300 rounded-lg text-sm"
+                                >
+                                    <option value="tiktok">TikTok / Reels</option>
+                                    <option value="facebook">Facebook / IG</option>
+                                    <option value="other">อื่น ๆ</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-semibold text-gray-600 block mb-1">คำอธิบายภาพ (ภาษาไทย)</label>
+                            <textarea
+                                value={thaiDesc}
+                                onChange={e => setThaiDesc(e.target.value)}
+                                rows={3}
+                                className="w-full border-gray-300 rounded-lg text-sm"
+                                placeholder="เช่น ถ่ายภาพสินค้าครีมกันแดดวางบนโต๊ะขาว มีแสงแดดส่อง มีกล่องสินค้าอยู่ด้านข้าง ดูมินิมอล สะอาด ตรงกลุ่มวัยทำงาน"
+                            />
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-semibold text-gray-600 block mb-1">
+                                เงื่อนไขเพิ่มเติม (Optional)
+                            </label>
+                            <input
+                                type="text"
+                                value={extra}
+                                onChange={e => setExtra(e.target.value)}
+                                className="w-full border-gray-300 rounded-lg text-sm"
+                                placeholder="no text on image, clean background"
+                            />
+                            <p className="text-xs text-gray-400 mt-1">
+                                ตัวอย่าง: no text on image, soft light, pastel color palette
+                            </p>
+                        </div>
+
+                        <div className="flex justify-start">
+                            <button
+                                onClick={handleGenerate}
+                                disabled={isGenerating}
+                                className="inline-flex items-center px-6 py-2 rounded-full bg-green-600 hover:bg-green-700 text-white text-sm font-semibold shadow-sm disabled:opacity-50"
+                            >
+                                {isGenerating ? (
+                                    <>
+                                        <i className="fa-solid fa-circle-notch fa-spin mr-2"></i>
+                                        กำลังสร้าง Prompt...
+                                    </>
+                                ) : (
+                                    <>
+                                        <i className="fa-solid fa-wand-magic-sparkles mr-2"></i>
+                                        สร้าง Prompt ภาษาอังกฤษ
+                                    </>
+                                )}
+                            </button>
+                        </div>
+                    </div>
+
+                    {resultPrompt && (
+                        <div className="bg-gray-900 text-green-100 rounded-2xl p-5 font-mono text-sm mt-4 relative overflow-hidden">
+                            <div className="flex justify-between items-center mb-3 relative z-10">
+                                <h3 className="font-semibold text-sm flex items-center gap-2">
+                                    <i className="fa-solid fa-terminal"></i>
+                                    Prompt สำหรับ Gemini / Midjourney
+                                </h3>
+                                <button
+                                    onClick={handleCopy}
+                                    className="text-xs text-green-200 hover:text-white flex items-center gap-1"
+                                >
+                                    <i className="fa-regular fa-copy"></i> Copy Prompt
+                                </button>
+                            </div>
+                            <pre className="whitespace-pre-wrap text-xs leading-relaxed relative z-10">
+{resultPrompt}
+                            </pre>
+                            <div className="absolute inset-0 opacity-10 pointer-events-none bg-[radial-gradient(circle_at_top,_#22c55e,_transparent_60%)]"></div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+const ToolsContainer = ({ apiKey }) => {
+            const [activeTool, setActiveTool] = useState(1);
+            const tools = [
+                {id:1, name:'Script Maker', icon:'fa-file-pen', color:'text-indigo-600', bg:'bg-indigo-50'},
+                {id:2, name:'Viral Finder', icon:'fa-fire', color:'text-orange-600', bg:'bg-orange-50'},
+                {id:3, name:'Review Gen', icon:'fa-star', color:'text-yellow-600', bg:'bg-yellow-50'},
+                {id:4, name:'Auto-cut', icon:'fa-scissors', color:'text-pink-600', bg:'bg-pink-50'},
+                {id:5, name:'AI Image Gen', icon:'fa-image', color:'text-green-600', bg:'bg-green-50'},
+                {id:6, name:'AI Factory', icon:'fa-industry', color:'text-slate-600', bg:'bg-slate-50'},
+            ];
+            const handleToolClick = (tool) => {
+                if (tool.id === 6) {
+                    window.open('https://roaring-torte-c44f5a.netlify.app/', '_blank');
+                    return;
+                }
+                setActiveTool(tool.id);
+            };
+            return (
+                <div className="bg-gray-50 min-h-screen">
+                    <div className="max-w-7xl mx-auto px-4 py-12">
+                        <div className="flex flex-col lg:flex-row gap-8 items-start">
+                            
+                            <div className="lg:w-1/4 w-full bg-white rounded-2xl shadow-sm border border-gray-100 p-2 lg:sticky lg:top-24">
+                                {tools.map(t => (
+                                    <button
+                                        key={t.id}
+                                        onClick={() => handleToolClick(t)}
+                                        className={
+                                            "w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm mb-1 transition " +
+                                            (t.id === activeTool
+                                                ? `${t.bg} ${t.color} font-semibold shadow-sm`
+                                                : "text-gray-600 hover:bg-gray-50")
+                                        }
+                                    >
+                                        <i className={`fa-solid ${t.icon} w-6 text-center`}></i>
+                                        <span>{t.name}</span>
+                                        {t.id === 6 && (
+                                            <span className="ml-auto text-[10px] uppercase tracking-wide bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full border border-slate-200">
+                                                New
+                                            </span>
+                                        )}
+                                    </button>
+                                ))}
+                            </div>
+
+<div className="lg:w-3/4 w-full">
+                                {activeTool === 1 && <Tool1_ScriptMaker apiKey={apiKey} />}
+                                {activeTool === 2 && <Tool2_ViralFinder apiKey={apiKey} />}
+                                {activeTool === 3 && <Tool3_ReviewGen apiKey={apiKey} />}
+                                {activeTool === 4 && <Tool4_AutoCut />}
+                                {activeTool === 5 && <Tool5_AIImageGen apiKey={apiKey} />}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const Services = () => (
+             <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16">
+                <h2 className="text-3xl font-bold text-center mb-16 text-gray-900">บริการของเรา</h2>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+                    {[
+                        { title: 'AI Automation', desc: 'พัฒนาระบบ AI ลดงานซ้ำซ้อน', icon: 'fa-robot', color: 'bg-blue-100 text-blue-600' },
+                        { title: 'TikTok Media', desc: 'บริหารช่องและสร้างคอนเทนต์', icon: 'fa-video', color: 'bg-pink-100 text-pink-600' },
+                        { title: 'Business Consultant', desc: 'ที่ปรึกษาเทคโนโลยีองค์กร', icon: 'fa-chart-line', color: 'bg-purple-100 text-purple-600' },
+                    ].map((s, i) => (
+                        <div key={i} className="bg-white p-10 rounded-3xl shadow-lg border border-gray-100 hover:shadow-2xl transition duration-300 tool-card group">
+                            <div className={`w-20 h-20 ${s.color} rounded-2xl flex items-center justify-center text-3xl mx-auto mb-8 group-hover:scale-110 transition`}>
+                                <i className={`fa-solid ${s.icon}`}></i>
+                            </div>
+                            <h3 className="text-xl font-bold mb-4 text-gray-800">{s.title}</h3>
+                            <p className="text-gray-500 leading-relaxed">{s.desc}</p>
+                        </div>
+                    ))}
+                </div>
+            </div>
+        );
+
+        const Team = () => (
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16 bg-white">
+                <h2 className="text-3xl font-bold text-center mb-12">ทีมงานผู้เชี่ยวชาญ</h2>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-8">
+                    {[1, 2, 3, 4].map((i) => (
+                        <div key={i} className="bg-gray-50 rounded-2xl overflow-hidden hover:shadow-lg transition border border-gray-100">
+                            {i === 1 ? (
+                                <div className="h-56 bg-gray-200 flex items-center justify-center text-gray-400 relative overflow-hidden group">
+                                    {/* รูปคุณบูม – ใส่ไฟล์ Boom 3B Group.png ไว้ในโฟลเดอร์เดียวกับไฟล์ HTML */}
+                                    <img
+                                        src="Boom%203B%20Group.png"
+                                        alt="Worawat Piangchompoo - AI Specialist 1"
+                                        className="w-full h-full object-cover transition duration-500 group-hover:scale-110"
+                                    />
+                                </div>
+                            ) : (
+                                <div className="h-56 bg-gray-200 flex items-center justify-center text-gray-400 relative overflow-hidden group">
+                                    <i className="fa-solid fa-user text-6xl group-hover:scale-110 transition duration-500"></i>
+                                    <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent opacity-0 group-hover:opacity-100 transition"></div>
+                                </div>
+                            )}
+                            <div className="p-6 text-center">
+                                <h3 className="font-bold text-lg text-gray-800">AI Specialist {i}</h3>
+                                <p className="text-indigo-600 text-sm font-medium mb-3">Developer & Content</p>
+                                <div className="flex justify-center gap-3 text-gray-400">
+                                    <i className="fa-brands fa-linkedin hover:text-indigo-600 cursor-pointer"></i>
+                                    <i className="fa-brands fa-twitter hover:text-blue-400 cursor-pointer"></i>
+                                </div>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            </div>
+        );
+
+
+        const About = () => (
+            <div className="max-w-7xl mx-auto px-4 py-16">
+                <div className="bg-white rounded-3xl shadow-xl overflow-hidden flex flex-col md:flex-row">
+                    <div className="md:w-1/2 p-12 flex flex-col justify-center">
+                        <span className="text-indigo-600 font-bold tracking-wider uppercase text-sm mb-2">Our Story</span>
+                        <h2 className="text-3xl md:text-4xl font-bold mb-6 text-gray-900">เกี่ยวกับ 3B Group</h2>
+                        <p className="text-gray-600 mb-6 leading-relaxed text-lg">
+                            เราคือ 3B Group (AI Media, AI Factory) ผู้นำนวัตกรรม AI สำหรับธุรกิจยุคใหม่ เราสร้างเครื่องมือที่ใช้งานได้จริง (Ready-to-use) เพื่อช่วยผู้ประกอบการลดต้นทุนและเพิ่มยอดขายในยุคดิจิทัล</p>
+                        <ul className="space-y-3 text-gray-600">
+                            <li className="flex items-center"><i className="fa-solid fa-check-circle text-green-500 mr-3"></i> เชี่ยวชาญทั้ง Factory & Media</li>
+                            <li className="flex items-center"><i className="fa-solid fa-check-circle text-green-500 mr-3"></i> AI Technology ที่จับต้องได้</li>
+                            <li className="flex items-center"><i className="fa-solid fa-check-circle text-green-500 mr-3"></i> โฟกัสผลลัพธ์ทางธุรกิจ</li>
+                        </ul>
+                    </div>
+                    <div className="md:w-1/2 bg-gradient-to-br from-indigo-600 to-purple-700 p-12 flex items-center justify-center text-white relative overflow-hidden">
+                        <div className="absolute top-0 right-0 w-64 h-64 bg-white opacity-10 rounded-full -mr-16 -mt-16 blur-3xl"></div>
+                        <div className="text-center relative z-10">
+                            <div className="mb-10">
+                                <h3 className="text-7xl font-bold mb-2">5+</h3>
+                                <p className="text-xl opacity-90 font-medium">AI Products</p>
+                            </div>
+                            <div>
+                                <h3 className="text-7xl font-bold mb-2">100%</h3>
+                                <p className="text-xl opacity-90 font-medium">Automation Focus</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        );
+
+        const Contact = () => (
+             <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-16">
+                <div className="bg-white rounded-3xl shadow-2xl p-8 md:p-16 text-center border border-gray-100">
+                    <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-8">
+                        <i className="fa-brands fa-line text-4xl text-green-600"></i>
+                    </div>
+                    <h2 className="text-3xl font-bold mb-4 text-gray-900">พร้อมยกระดับธุรกิจของคุณหรือยัง?</h2>
+                    <p className="text-gray-600 mb-8 text-lg">ปรึกษาทีมงาน 3B Group วันนี้ เพื่อโซลูชัน AI ที่ดีที่สุด</p>
+                    
+                    <div className="space-y-4 mb-10 text-gray-600">
+                        <div className="flex items-center justify-center gap-3">
+                            <i className="fa-solid fa-phone text-indigo-600 text-xl"></i>
+                            <span className="font-bold text-lg">085-921-3913</span>
+                        </div>
+                        <div className="flex items-center justify-center gap-3">
+                            <i className="fa-solid fa-envelope text-indigo-600 text-xl"></i>
+                            <span className="font-bold text-lg">worawat.araya@gmail.com</span>
+                        </div>
+                        <div className="flex items-center justify-center gap-3">
+                            <i className="fa-brands fa-tiktok text-pink-600 text-xl"></i>
+                            <span className="font-bold text-lg">@3bmedia24</span>
+                        </div>
+                    </div>
+
+                    <a href="https://line.me/ti/p/~bum77" target="_blank" className="inline-block w-full max-w-md bg-[#06C755] text-white py-5 rounded-2xl text-xl font-bold hover:bg-[#05b04d] transition shadow-xl shadow-green-200 transform hover:scale-105 mb-10">
+                        <i className="fa-brands fa-line mr-3 text-2xl"></i> แอดไลน์: bum77
+                    </a>
+                    
+                    <div className="flex justify-center gap-8 border-t border-gray-100 pt-8">
+                         <a href="#" className="text-gray-400 hover:text-indigo-600 transition"><i className="fa-brands fa-facebook text-3xl"></i></a>
+                         <a href="#" className="text-gray-400 hover:text-pink-600 transition"><i className="fa-brands fa-tiktok text-3xl"></i></a>
+                         <a href="#" className="text-gray-400 hover:text-blue-500 transition"><i className="fa-solid fa-envelope text-3xl"></i></a>
+                    </div>
+                </div>
+            </div>
+        );
+
+        const Footer = () => (
+            <footer className="bg-gray-900 text-white py-12 mt-auto border-t border-gray-800">
+                <div className="max-w-7xl mx-auto px-4 text-center">
+                    <div className="mb-6 flex justify-center items-center gap-2">
+                        <i className="fa-solid fa-robot text-indigo-400"></i>
+                        <span className="font-bold text-xl tracking-tight">Auto Life</span>
+                    </div>
+                    <p className="text-gray-400 text-sm mb-8">Bangkok, Thailand | Developed by 3B Group (AI Media, AI Factory)</p>
+                    <div className="text-xs text-gray-600">© 2024 All rights reserved.</div>
+                </div>
+            </footer>
+        );
+
+        // --- Main App ---
+
+        // Toggle this flag to control developer-only features. When set to false
+        // the API key modal and related UI elements will be hidden from end users.
+        const IS_DEV = false;
+
+        const App = () => {
+            const [activePage, setActivePage] = useState('home');
+            const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+            const [apiKey, setApiKey] = useState(FIXED_API_KEY || localStorage.getItem('autoLife_apiKey') || '');
+
+            useEffect(() => {
+                // Persist or check apiKey if needed, or just keep in state
+            }, [apiKey]);
+
+            const toggleMobileMenu = () => setIsMobileMenuOpen(!isMobileMenuOpen);
+            const setPage = (page) => {
+                setActivePage(page);
+                setIsMobileMenuOpen(false); // Close mobile menu on navigate
+                window.scrollTo(0, 0);
+            };
+
+            return (
+                <div className="min-h-screen flex flex-col font-sans text-gray-900">
+                    <Navbar 
+                        setPage={setPage} 
+                        activePage={activePage} 
+                        toggleMobileMenu={toggleMobileMenu} 
+                        isMobileMenuOpen={isMobileMenuOpen}
+                        setApiKey={setApiKey}
+                        apiKey={apiKey}
+                    />
+                    
+                    <div className="flex-grow pt-16">
+                        {activePage === 'home' && (
+                            <>
+                                <Hero setPage={setPage} />
+                                <Services />
+                            </>
+                        )}
+                        {activePage === 'about' && <About />}
+                        {activePage === 'services' && <Services />}
+                        {activePage === 'tools' && <ToolsContainer apiKey={apiKey} />}
+                        {activePage === 'team' && <Team />}
+                        {activePage === 'contact' && <Contact />}
+                    </div>
+
+                    <Footer />
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
