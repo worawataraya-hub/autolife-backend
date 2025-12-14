@@ -1,76 +1,464 @@
 // server.js
 require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const axios = require('axios');
+const { createClient } = require('@supabase/supabase-js');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
+
+// ---------- ENV ----------
 const PORT = process.env.PORT || 4000;
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
+
+const PADDLE_ENV = process.env.PADDLE_ENV || 'sandbox'; // sandbox | live
+const PADDLE_API_KEY = process.env.PADDLE_API_KEY;
+const PADDLE_BASIC_PRICE_ID = process.env.PADDLE_BASIC_PRICE_ID;
+const PADDLE_PRO_PRICE_ID = process.env.PADDLE_PRO_PRICE_ID;
+const CHECKOUT_SUCCESS_URL = process.env.CHECKOUT_SUCCESS_URL;
+const CHECKOUT_CANCEL_URL = process.env.CHECKOUT_CANCEL_URL;
+
+// ---------- BASIC APP SETUP ----------
 app.use(cors());
 app.use(express.json());
 
-// health check
+// ---------- SUPABASE CLIENT ----------
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+// ---------- GEMINI CLIENT ----------
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const geminiModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+// ---------- PLAN & LIMIT CONFIG ----------
+const PLAN_LIMITS = {
+  free: 20,   // Free tier: 20 ครั้ง/วัน
+  basic: 20,  // เริ่มที่ 20 เหมือนกัน ปรับทีหลังง่าย
+  pro: null   // null = ไม่จำกัด
+};
+
+const PRICE_TO_PLAN = {
+  [PADDLE_BASIC_PRICE_ID]: 'basic',
+  [PADDLE_PRO_PRICE_ID]: 'pro'
+};
+
+// ---------- HELPER ----------
+function todayISODate() {
+  // ใช้วันที่แบบ UTC ง่าย ๆ
+  return new Date().toISOString().slice(0, 10);
+}
+
+function signToken(user) {
+  return jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      plan: user.plan
+    },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+  );
+}
+
+function authRequired(req, res, next) {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+
+  if (!token) {
+    return res.status(401).json({ error: 'unauthorized: no token' });
+  }
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload;
+    next();
+  } catch (err) {
+    console.error('JWT error', err);
+    res.status(401).json({ error: 'unauthorized: invalid token' });
+  }
+}
+
+async function getUsageRecord(userId, date) {
+  const { data, error } = await supabase
+    .from('usage_daily')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('date', date)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
+
+async function incrementUsage(userId, date) {
+  const existing = await getUsageRecord(userId, date);
+  if (!existing) {
+    const { error } = await supabase
+      .from('usage_daily')
+      .insert({ user_id: userId, date, used: 1 });
+    if (error) throw error;
+    return 1;
+  } else {
+    const { data, error } = await supabase
+      .from('usage_daily')
+      .update({ used: existing.used + 1 })
+      .eq('id', existing.id)
+      .select()
+      .single();
+    if (error) throw error;
+    return data.used;
+  }
+}
+
+async function getUsageInfo(userId, plan) {
+  const limit = PLAN_LIMITS[plan] ?? null; // null = no limit
+  const date = todayISODate();
+
+  const rec = await getUsageRecord(userId, date);
+  const used = rec ? rec.used : 0;
+
+  return {
+    date,
+    used,
+    limit,
+    remaining: limit == null ? null : Math.max(limit - used, 0)
+  };
+}
+
+function checkDailyLimit() {
+  return async (req, res, next) => {
+    try {
+      const { id: userId, plan } = req.user;
+
+      const info = await getUsageInfo(userId, plan);
+
+      // ถ้า plan ไม่จำกัดก็ผ่านเลย
+      if (info.limit == null) {
+        req.usageInfo = info;
+        return next();
+      }
+
+      if (info.used >= info.limit) {
+        return res.status(429).json({
+          error: 'daily_limit_reached',
+          message: `คุณใช้ครบ ${info.limit} ครั้ง/วันแล้ว โปรดรอวันถัดไป หรืออัปเกรดแพ็กเกจ`,
+          usage: info
+        });
+      }
+
+      req.usageInfo = info;
+      next();
+    } catch (err) {
+      console.error('checkDailyLimit error', err);
+      res.status(500).json({ error: 'internal_error' });
+    }
+  };
+}
+
+// ---------- ROUTES ----------
+
+// Health check
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, service: 'AutoLife Gemini Image API' });
+  res.json({ ok: true, service: 'AutoLife backend with Supabase & Paddle' });
 });
 
-// เรียก Gemini แบบข้อความ ใช้ร่วมกันทุก Tools
-app.post('/api/gemini-text', async (req, res) => {
+// ---- AUTH ----
+
+// Register
+app.post('/api/auth/register', async (req, res) => {
   try {
-    const { prompt, useSearch } = req.body || {};
-
-    if (!prompt || typeof prompt !== 'string') {
-      return res.status(400).json({ error: 'prompt (string) is required' });
+    const { email, password } = req.body || {};
+    if (!email || !password) {
+      return res.status(400).json({ error: 'email_and_password_required' });
     }
 
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({ error: 'GEMINI_API_KEY is not set' });
+    const normalizedEmail = String(email).trim().toLowerCase();
+
+    // check exist
+    const { data: existing, error: existingErr } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', normalizedEmail)
+      .maybeSingle();
+
+    if (existingErr) throw existingErr;
+    if (existing) {
+      return res.status(409).json({ error: 'email_already_registered' });
     }
 
-    const payload = {
-      contents: [{ parts: [{ text: prompt }] }],
-    };
+    const password_hash = await bcrypt.hash(password, 10);
 
-    // ถ้าอยากให้บางกรณีใช้ Google Search Grounding
-    if (useSearch) {
-      payload.tools = [{ google_search: {} }];
-    }
+    const { data: newUser, error: insertErr } = await supabase
+      .from('users')
+      .insert({
+        email: normalizedEmail,
+        password_hash,
+        plan: 'free'
+      })
+      .select()
+      .single();
 
-    const url =
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent'
-      + `?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`;
+    if (insertErr) throw insertErr;
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+    const token = signToken(newUser);
+
+    res.json({
+      token,
+      user: {
+        id: newUser.id,
+        email: newUser.email,
+        plan: newUser.plan
+      }
     });
-
-    const data = await response.json();
-
-    if (!response.ok || data.error) {
-      console.error('Gemini error:', data.error || data);
-      return res.status(500).json({
-        error: data.error?.message || 'Gemini API error',
-      });
-    }
-
-    const text =
-      data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-    if (!text) {
-      return res.status(500).json({ error: 'No text returned from Gemini' });
-    }
-
-    res.json({ text });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'internal server error' });
+    console.error('register error', err);
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) {
+      return res.status(400).json({ error: 'email_and_password_required' });
+    }
 
+    const normalizedEmail = String(email).trim().toLowerCase();
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', normalizedEmail)
+      .single();
+
+    if (error || !user) {
+      return res.status(401).json({ error: 'invalid_credentials' });
+    }
+
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) {
+      return res.status(401).json({ error: 'invalid_credentials' });
+    }
+
+    const token = signToken(user);
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        plan: user.plan
+      }
+    });
+  } catch (err) {
+    console.error('login error', err);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Current user
+app.get('/api/me', authRequired, async (req, res) => {
+  try {
+    const { id } = req.user;
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('id, email, plan, created_at, paddle_customer_id, paddle_subscription_id')
+      .eq('id', id)
+      .single();
+
+    if (error || !user) {
+      return res.status(404).json({ error: 'user_not_found' });
+    }
+
+    const usage = await getUsageInfo(user.id, user.plan);
+
+    res.json({ user, usage });
+  } catch (err) {
+    console.error('/api/me error', err);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Usage info
+app.get('/api/usage', authRequired, async (req, res) => {
+  try {
+    const info = await getUsageInfo(req.user.id, req.user.plan);
+    res.json(info);
+  } catch (err) {
+    console.error('/api/usage error', err);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ---- GEMINI SCRIPT GENERATION ----
+// ตัวอย่าง endpoint ใช้ limit 20 ครั้ง/วัน
+app.post('/api/generate-script', authRequired, checkDailyLimit(), async (req, res) => {
+  try {
+    const { prompt } = req.body || {};
+    if (!prompt) {
+      return res.status(400).json({ error: 'prompt_required' });
+    }
+
+    const result = await geminiModel.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
+
+    // นับ usage ครั้งนี้
+    const used = await incrementUsage(req.user.id, todayISODate());
+    const usageInfo = await getUsageInfo(req.user.id, req.user.plan);
+
+    res.json({
+      text,
+      usage: usageInfo
+    });
+  } catch (err) {
+    console.error('generate-script error', err);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ---- PADDLE CHECKOUT (ลูกค้าเริ่มจ่ายเงิน) ----
+app.post('/api/paddle/create-checkout', authRequired, async (req, res) => {
+  try {
+    const { priceId } = req.body || {};
+    if (!priceId) {
+      return res.status(400).json({ error: 'priceId_required' });
+    }
+
+    if (!PADDLE_API_KEY) {
+      return res.status(500).json({ error: 'paddle_not_configured' });
+    }
+
+    const plan = PRICE_TO_PLAN[priceId];
+    if (!plan) {
+      return res.status(400).json({ error: 'unknown_price_id' });
+    }
+
+    const apiBase =
+      PADDLE_ENV === 'live'
+        ? 'https://api.paddle.com'
+        : 'https://sandbox-api.paddle.com';
+
+    const body = {
+      items: [{ price_id: priceId, quantity: 1 }],
+      customer: {
+        email: req.user.email
+      },
+      metadata: {
+        user_id: req.user.id
+      },
+      success_url: CHECKOUT_SUCCESS_URL,
+      cancel_url: CHECKOUT_CANCEL_URL
+    };
+
+    const response = await axios.post(
+      `${apiBase}/checkout/sessions`,
+      body,
+      {
+        headers: {
+          Authorization: `Bearer ${PADDLE_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    const session = response.data;
+
+    // Paddle Billing v2 จะส่ง checkout_url / id กลับมา
+    const checkoutUrl = session?.data?.checkout_url || session?.checkout_url;
+
+    res.json({
+      sessionId: session?.data?.id || session?.id,
+      checkoutUrl
+    });
+  } catch (err) {
+    console.error('create-checkout error', err.response?.data || err);
+    res.status(500).json({ error: 'paddle_error' });
+  }
+});
+
+// ---- PADDLE WEBHOOK ----
+// NOTE: Paddle destination URL in your dashboard can be either:
+//   https://autolife-backend.onrender.com/api/paddle/webhook   (recommended)
+// or https://autolife-backend.onrender.com/paddle/webhook     (alias added for convenience)
+const paddleWebhookHandler = async (req, res) => {
+  try {
+    console.log('[PADDLE_WEBHOOK]', new Date().toISOString(), 'path=', req.originalUrl);
+    console.log('[PADDLE_WEBHOOK] headers:', { 'paddle-signature': req.headers['paddle-signature'], 'user-agent': req.headers['user-agent'] });
+    console.log('[PADDLE_WEBHOOK] body:', req.body);
+  } catch (e) {}
+
+  try {
+    const event = req.body;
+    const type = event.event_type || event.type;
+
+    console.log('Paddle webhook:', type);
+
+    // ตัวอย่างสำหรับ Billing v2: subscription.activated / subscription.updated
+    if (
+      type === 'subscription.activated' ||
+      type === 'subscription.updated'
+    ) {
+      const data = event.data || event;
+      const priceId =
+        data.items?.[0]?.price?.id ||
+        data.items?.[0]?.price_id ||
+        data.price_id;
+
+      const plan = PRICE_TO_PLAN[priceId];
+
+      const email =
+        data.customer?.email || data.customer_email || data.user_email;
+
+      if (plan && email) {
+        const { data: user, error } = await supabase
+          .from('users')
+          .update({
+            plan,
+            paddle_customer_id: data.customer?.id || data.customer_id || null,
+            paddle_subscription_id: data.id || data.subscription_id || null
+          })
+          .eq('email', email.toLowerCase())
+          .select()
+          .single();
+
+        if (error) {
+          console.error('supabase update error from webhook', error);
+        } else {
+          console.log('Updated user from webhook:', user.email, 'plan:', user.plan);
+        }
+      } else {
+        console.warn('Webhook plan/email not resolved', { priceId, plan, email 
+};
+
+app.post('/api/paddle/webhook', paddleWebhookHandler);
+app.post('/paddle/webhook', paddleWebhookHandler);
+
+// Quick sanity checks (open in browser)
+app.get('/api/paddle/webhook', (req, res) => res.status(200).send('ok'));
+app.get('/paddle/webhook', (req, res) => res.status(200).send('ok'));
+      }
+    }
+
+    res.status(200).send('ok');
+  } catch (err) {
+    console.error('webhook error', err);
+    res.status(500).send('error');
+  }
+});
+
+// ---------- START ----------
 app.listen(PORT, () => {
   console.log(`✅ AutoLife backend listening on http://localhost:${PORT}`);
 });
