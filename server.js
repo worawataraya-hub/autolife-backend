@@ -6,6 +6,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
@@ -30,7 +31,14 @@ const CHECKOUT_CANCEL_URL = process.env.CHECKOUT_CANCEL_URL;
 
 // ---------- BASIC APP SETUP ----------
 app.use(cors());
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    // Keep raw body for Paddle webhook signature verification
+    if (req.originalUrl && req.originalUrl.includes('/paddle/webhook')) {
+      req.rawBody = buf;
+    }
+  }
+}));
 
 // ---------- SUPABASE CLIENT ----------
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -391,26 +399,75 @@ app.post('/api/paddle/create-checkout', authRequired, async (req, res) => {
 // ---- PADDLE WEBHOOK ----
 // NOTE: Paddle destination URL in your dashboard can be either:
 //   https://autolife-backend.onrender.com/api/paddle/webhook   (recommended)
-// or https://autolife-backend.onrender.com/paddle/webhook     (alias added for convenience)
-const paddleWebhookHandler = async (req, res) => {
-  try {
-    console.log('[PADDLE_WEBHOOK]', new Date().toISOString(), 'path=', req.originalUrl);
-    console.log('[PADDLE_WEBHOOK] headers:', { 'paddle-signature': req.headers['paddle-signature'], 'user-agent': req.headers['user-agent'] });
-    console.log('[PADDLE_WEBHOOK] body:', req.body);
-  } catch (e) {}
+// ============================================================
+// Paddle Webhook (Billing / Notifications v2)
+// Endpoints:
+//   POST /paddle/webhook
+//   POST /api/paddle/webhook
+// ============================================================
 
+const PADDLE_WEBHOOK_SECRET = process.env.PADDLE_WEBHOOK_SECRET;
+
+// Verify Paddle signature (Billing / Notifications v2).
+// Header: "Paddle-Signature" => "ts=...,h1=..."
+// Signed payload: `${ts}:${rawBody}`
+// HMAC: sha256 with webhook secret, hex digest
+function verifyPaddleSignature(req) {
+  const sigHeader = req.get('Paddle-Signature') || req.get('paddle-signature');
+  if (!PADDLE_WEBHOOK_SECRET) return { ok: false, reason: 'Missing PADDLE_WEBHOOK_SECRET' };
+  if (!sigHeader) return { ok: false, reason: 'Missing Paddle-Signature header' };
+
+  const parts = Object.fromEntries(
+    sigHeader.split(';').map((kv) => {
+      const [k, ...rest] = kv.split('=');
+      return [k.trim(), rest.join('=').trim()];
+    })
+  );
+
+  const ts = parts.ts;
+  const h1 = parts.h1;
+  if (!ts || !h1) return { ok: false, reason: 'Invalid Paddle-Signature format' };
+
+  const raw = req.rawBody
+    ? Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from(req.rawBody)
+    : Buffer.from(JSON.stringify(req.body || {}));
+
+  const signedPayload = `${ts}:${raw.toString('utf8')}`;
+  const expected = crypto
+    .createHmac('sha256', PADDLE_WEBHOOK_SECRET)
+    .update(signedPayload, 'utf8')
+    .digest('hex');
+
+  // timing-safe compare
   try {
-    const event = req.body;
+    const a = Buffer.from(expected, 'hex');
+    const b = Buffer.from(h1, 'hex');
+    if (a.length !== b.length) return { ok: false, reason: 'Signature length mismatch' };
+    const ok = crypto.timingSafeEqual(a, b);
+    return ok ? { ok: true } : { ok: false, reason: 'Signature mismatch' };
+  } catch (e) {
+    return { ok: false, reason: 'Signature compare error' };
+  }
+}
+
+async function paddleWebhookHandler(req, res) {
+  try {
+    const ver = verifyPaddleSignature(req);
+    if (!ver.ok) {
+      console.warn('[PADDLE_WEBHOOK] signature failed:', ver.reason);
+      return res.status(401).send('invalid signature');
+    }
+
+    const event = req.body || {};
     const type = event.event_type || event.type;
 
-    console.log('Paddle webhook:', type);
+    console.log('[PADDLE_WEBHOOK] event:', type);
 
-    // ตัวอย่างสำหรับ Billing v2: subscription.activated / subscription.updated
-    if (
-      type === 'subscription.activated' ||
-      type === 'subscription.updated'
-    ) {
-      const data = event.data || event;
+    // Billing v2 usually includes data in event.data
+    const data = event.data || event;
+
+    // --- Update user plan on subscription events ---
+    if (type === 'subscription.activated' || type === 'subscription.updated') {
       const priceId =
         data.items?.[0]?.price?.id ||
         data.items?.[0]?.price_id ||
@@ -419,7 +476,9 @@ const paddleWebhookHandler = async (req, res) => {
       const plan = PRICE_TO_PLAN[priceId];
 
       const email =
-        data.customer?.email || data.customer_email || data.user_email;
+        data.customer?.email ||
+        data.customer_email ||
+        data.user_email;
 
       if (plan && email) {
         const { data: user, error } = await supabase
@@ -429,35 +488,61 @@ const paddleWebhookHandler = async (req, res) => {
             paddle_customer_id: data.customer?.id || data.customer_id || null,
             paddle_subscription_id: data.id || data.subscription_id || null
           })
-          .eq('email', email.toLowerCase())
+          .eq('email', String(email).toLowerCase())
           .select()
           .single();
 
         if (error) {
-          console.error('supabase update error from webhook', error);
+          console.error('[PADDLE_WEBHOOK] supabase update error', error);
         } else {
-          console.log('Updated user from webhook:', user.email, 'plan:', user.plan);
+          console.log('[PADDLE_WEBHOOK] updated user:', user.email, 'plan:', user.plan);
         }
       } else {
-        console.warn('Webhook plan/email not resolved', { priceId, plan, email 
-};
+        console.warn('[PADDLE_WEBHOOK] plan/email not resolved', { priceId, plan, email });
+      }
+    }
 
+    // --- Optional: handle transaction.completed as well (some flows rely on this) ---
+    if (type === 'transaction.completed') {
+      const email =
+        data.customer?.email ||
+        data.customer_email ||
+        data.user_email;
+
+      const priceId =
+        data.items?.[0]?.price?.id ||
+        data.items?.[0]?.price_id ||
+        data.price_id;
+
+      const plan = PRICE_TO_PLAN[priceId];
+
+      if (plan && email) {
+        const { error } = await supabase
+          .from('users')
+          .update({
+            plan,
+            paddle_customer_id: data.customer?.id || data.customer_id || null
+          })
+          .eq('email', String(email).toLowerCase());
+
+        if (error) console.error('[PADDLE_WEBHOOK] transaction update error', error);
+      }
+    }
+
+    return res.status(200).send('ok');
+  } catch (err) {
+    console.error('[PADDLE_WEBHOOK] error', err);
+    return res.status(500).send('error');
+  }
+}
+
+// Webhook endpoints (both paths supported)
 app.post('/api/paddle/webhook', paddleWebhookHandler);
 app.post('/paddle/webhook', paddleWebhookHandler);
 
 // Quick sanity checks (open in browser)
 app.get('/api/paddle/webhook', (req, res) => res.status(200).send('ok'));
 app.get('/paddle/webhook', (req, res) => res.status(200).send('ok'));
-      }
-    }
-
-    res.status(200).send('ok');
-  } catch (err) {
-    console.error('webhook error', err);
-    res.status(500).send('error');
-  }
-});
-
 // ---------- START ----------
 app.listen(PORT, () => {
   console.log(`✅ AutoLife backend listening on http://localhost:${PORT}`);
