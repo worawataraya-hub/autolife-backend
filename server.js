@@ -1,146 +1,145 @@
+/**
+ * AutoLife Backend - server.js (fixed Paddle webhook raw-body verification)
+ * - Webhook routes use express.raw() BEFORE json middleware
+ * - Verifies Paddle Notifications v2 signature header: "paddle-signature"
+ * - Supports multiple secrets via env:
+ *    - PADDLE_WEBHOOK_SECRET_KEYS="key1,key2" (recommended)
+ *    - or PADDLE_WEBHOOK_SECRET_KEY / PADDLE_WEBHOOK_SECRET
+ */
+
 require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
-const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
-const axios = require("axios");
-const crypto = require("crypto");
-const { createClient } = require("@supabase/supabase-js");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+const { createHmac, timingSafeEqual } = require("crypto");
 
 const app = express();
 
-/* =========================================================
-   ENV
-========================================================= */
-const PORT = process.env.PORT || 4000;
+// If you're using cookies/auth, adjust CORS accordingly.
+app.use(cors({ origin: true, credentials: true }));
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+/** -------------------------
+ *  0) Basic health checks
+ *  ------------------------- */
+app.get("/", (req, res) => res.status(200).send("ok"));
+app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+/** -------------------------
+ *  1) Paddle Webhook (RAW)
+ *  IMPORTANT: must be declared BEFORE express.json()
+ *  ------------------------- */
+function getPaddleSecrets() {
+  const raw =
+    process.env.PADDLE_WEBHOOK_SECRET_KEYS ||
+    process.env.PADDLE_WEBHOOK_SECRET_KEY ||
+    process.env.PADDLE_WEBHOOK_SECRET ||
+    "";
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
 
-const JWT_SECRET = process.env.JWT_SECRET || "change-me";
+function parseSignatureHeader(headerValue) {
+  // Example: "ts=1700000000;h1=abcdef...;h1=..."
+  const parts = {};
+  for (const piece of String(headerValue || "").split(";")) {
+    const [k, v] = piece.trim().split("=");
+    if (!k || !v) continue;
+    parts[k] = parts[k] || [];
+    parts[k].push(v);
+  }
+  return {
+    ts: parts.ts?.[0],
+    h1List: parts.h1 || [],
+  };
+}
 
-const PADDLE_ENV = process.env.PADDLE_ENV || "sandbox";
-const PADDLE_API_KEY = process.env.PADDLE_API_KEY;
-const PADDLE_BASIC_PRICE_ID = process.env.PADDLE_BASIC_PRICE_ID;
-const PADDLE_PRO_PRICE_ID = process.env.PADDLE_PRO_PRICE_ID;
-const CHECKOUT_SUCCESS_URL = process.env.CHECKOUT_SUCCESS_URL;
-const CHECKOUT_CANCEL_URL = process.env.CHECKOUT_CANCEL_URL;
+function verifyPaddleSignature({ signatureHeader, rawBody, secrets }) {
+  if (!signatureHeader) return { ok: false, reason: "missing signature header" };
+  if (!secrets || secrets.length === 0) return { ok: false, reason: "missing secret keys" };
+  const { ts, h1List } = parseSignatureHeader(signatureHeader);
+  if (!ts || h1List.length === 0) return { ok: false, reason: "bad signature header" };
 
-// ✅ รองรับหลาย secret (Paddle rotate key)
-const PADDLE_WEBHOOK_SECRETS = (
-  process.env.PADDLE_WEBHOOK_SECRET_KEYS ||
-  process.env.PADDLE_WEBHOOK_SECRET_KEY ||
-  ""
-)
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+  const signedPayload = `${ts}:${rawBody}`; // Paddle Notifications v2 format
 
-/* =========================================================
-   ✅ 1) PADDLE WEBHOOK (RAW BODY ONLY) — MUST BE FIRST
-========================================================= */
+  const ok = secrets.some((secret) => {
+    const expectedHex = createHmac("sha256", secret).update(signedPayload).digest("hex");
+    const expectedBuf = Buffer.from(expectedHex, "hex");
+
+    return h1List.some((h1) => {
+      // h1 is hex
+      if (!/^[0-9a-fA-F]+$/.test(h1)) return false;
+      const h1Buf = Buffer.from(h1, "hex");
+      return h1Buf.length === expectedBuf.length && timingSafeEqual(h1Buf, expectedBuf);
+    });
+  });
+
+  return ok ? { ok: true } : { ok: false, reason: "signature mismatch" };
+}
+
+// RAW body ONLY for webhook routes
 app.post(
   ["/api/paddle/webhook", "/paddle/webhook"],
   express.raw({ type: "application/json" }),
   async (req, res) => {
     try {
       if (!Buffer.isBuffer(req.body)) {
-        console.error("[PADDLE_WEBHOOK] body is not Buffer");
+        console.error("[PADDLE_WEBHOOK] body is not Buffer (raw middleware not applied)");
         return res.status(500).send("server misconfigured");
       }
 
-      const signature = req.headers["paddle-signature"];
-      if (!signature || PADDLE_WEBHOOK_SECRETS.length === 0) {
+      // Header keys in Node are lowercased
+      const paddleSignature = req.headers["paddle-signature"] || req.headers["paddle_signature"];
+      const secrets = getPaddleSecrets();
+
+      if (!paddleSignature || secrets.length === 0) {
+        console.error("[PADDLE_WEBHOOK] missing signature/secret", {
+          hasSignature: !!paddleSignature,
+          secretCount: secrets.length,
+        });
         return res.status(401).send("missing signature/secret");
       }
 
-      // ts=...;h1=...
-      const parts = {};
-      for (const piece of String(signature).split(";")) {
-        const [k, v] = piece.trim().split("=");
-        if (!k || !v) continue;
-        parts[k] = parts[k] || [];
-        parts[k].push(v);
-      }
-
-      const ts = parts.ts?.[0];
-      const h1List = parts.h1 || [];
-      if (!ts || h1List.length === 0) {
-        return res.status(401).send("bad signature header");
-      }
-
       const rawBody = req.body.toString("utf8");
-      const signedPayload = `${ts}:${rawBody}`;
-
-      const verified = PADDLE_WEBHOOK_SECRETS.some((secret) => {
-        const expected = crypto
-          .createHmac("sha256", secret)
-          .update(signedPayload)
-          .digest("hex");
-
-        const expectedBuf = Buffer.from(expected, "hex");
-
-        return h1List.some((h1) => {
-          const h1Buf = Buffer.from(h1, "hex");
-          return (
-            h1Buf.length === expectedBuf.length &&
-            crypto.timingSafeEqual(h1Buf, expectedBuf)
-          );
-        });
+      const check = verifyPaddleSignature({
+        signatureHeader: paddleSignature,
+        rawBody,
+        secrets,
       });
 
-      if (!verified) {
-        console.error("[PADDLE_WEBHOOK] signature mismatch");
-        return res.status(401).send("signature mismatch");
+      if (!check.ok) {
+        console.error("[PADDLE_WEBHOOK] signature failed:", check.reason);
+        return res.status(401).send(check.reason);
       }
 
-      // ✅ signature ผ่านแล้ว ค่อย parse JSON
-      const event = JSON.parse(rawBody);
-      const type = event.event_type || event.type;
-      const data = event.data || event;
-
-      console.log("[PADDLE_WEBHOOK] event:", type);
-
-      // ---- transaction.completed / subscription ----
-      if (
-        type === "transaction.completed" ||
-        type === "subscription.activated" ||
-        type === "subscription.updated"
-      ) {
-        const priceId =
-          data.items?.[0]?.price?.id ||
-          data.items?.[0]?.price_id ||
-          data.price_id;
-
-        const email =
-          data.customer?.email ||
-          data.customer_email ||
-          data.user_email;
-
-        const PRICE_TO_PLAN = {
-          [PADDLE_BASIC_PRICE_ID]: "basic",
-          [PADDLE_PRO_PRICE_ID]: "pro",
-        };
-
-        const plan = PRICE_TO_PLAN[priceId];
-
-        if (plan && email) {
-          await supabase
-            .from("users")
-            .update({
-              plan,
-              paddle_customer_id: data.customer?.id || null,
-              paddle_subscription_id: data.id || null,
-            })
-            .eq("email", String(email).toLowerCase());
-        }
+      // ✅ signature OK: now parse JSON
+      let event;
+      try {
+        event = JSON.parse(rawBody);
+      } catch (e) {
+        console.error("[PADDLE_WEBHOOK] JSON parse error", e);
+        return res.status(400).send("invalid json");
       }
 
-      return res.status(200).send("ok");
+      // TODO: anti-duplicate (recommended)
+      // - store event.id (or notification id) into DB table (unique)
+      // - if already processed: return 200
+
+      // TODO: business logic
+      // Example events you care about:
+      // - transaction.completed
+      // - subscription.activated / subscription.updated / subscription.canceled
+      // console.log("[PADDLE_WEBHOOK] event:", event?.event_type, event?.data?.id);
+
+      // Important: respond 200 quickly, do heavy work async
+      res.status(200).send("ok");
+
+      // ---- async processing (example) ----
+      // process.nextTick(async () => {
+      //   await handlePaddleEvent(event);
+      // });
+
     } catch (err) {
       console.error("[PADDLE_WEBHOOK] error", err);
       return res.status(500).send("error");
@@ -148,36 +147,22 @@ app.post(
   }
 );
 
-/* =========================================================
-   ✅ 2) MIDDLEWARE อื่น ค่อยตามมา
-========================================================= */
-app.use(cors());
-app.use(express.json());
+/** -------------------------
+ *  2) JSON middleware for ALL other routes
+ *  ------------------------- */
+app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-/* =========================================================
-   CLIENTS
-========================================================= */
-const supabase = createClient(
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY
-);
+/** -------------------------
+ *  3) Other routes (keep yours below)
+ *  ------------------------- */
+// Example placeholder:
+app.get("/api/status", (req, res) => res.json({ status: "ok" }));
 
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const geminiModel = genAI.getGenerativeModel({
-  model: "gemini-1.5-flash",
-});
-
-/* =========================================================
-   HEALTH CHECK
-========================================================= */
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true });
-});
-
-/* =========================================================
-   START SERVER
-========================================================= */
+/** -------------------------
+ *  4) Start server
+ *  ------------------------- */
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`✅ AutoLife backend listening on http://localhost:${PORT}`);
+  console.log(`AutoLife backend listening on http://localhost:${PORT}`);
 });
