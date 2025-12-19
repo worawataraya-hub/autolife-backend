@@ -82,6 +82,11 @@ function requireMinPlan(minPlan) {
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const geminiModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
+// --- Gemini key sanity check (helps avoid opaque 500 internal_error) ---
+if (!process.env.GEMINI_API_KEY) {
+  console.warn('[WARN] GEMINI_API_KEY is missing. /api/gemini-text will return 500 until you set it on Render.');
+}
+
 // ---------- PLAN & LIMIT CONFIG ----------
 const PLAN_LIMITS = {
   free: 20,   // Free tier: 20 ครั้ง/วัน
@@ -378,6 +383,11 @@ app.post('/api/gemini-text', authRequired, hydrateUserPlan, checkDailyLimit(), a
       return res.status(400).json({ error: 'prompt_required' });
     }
 
+    // Fail fast with a clear message if GEMINI_API_KEY is not set
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({ error: 'missing_gemini_api_key' });
+    }
+
     const result = await geminiModel.generateContent(prompt);
     const response = await result.response;
     const text = response.text();
@@ -391,8 +401,17 @@ app.post('/api/gemini-text', authRequired, hydrateUserPlan, checkDailyLimit(), a
       usage: usageInfo
     });
   } catch (err) {
-    console.error('generate-script error', err);
-    res.status(500).json({ error: 'internal_error' });
+    // Log maximum useful info (Render logs)
+    const status = err?.status || err?.response?.status;
+    const details = err?.response?.data || err?.response || err;
+    console.error('gemini-text error:', { status, message: err?.message, details });
+
+    // In production, still keep response minimal but more actionable than "internal_error"
+    if (String(err?.message || '').toLowerCase().includes('api key') || String(details || '').toLowerCase().includes('api key')) {
+      return res.status(500).json({ error: 'invalid_gemini_api_key' });
+    }
+
+    return res.status(500).json({ error: 'internal_error' });
   }
 });
 
