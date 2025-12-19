@@ -80,7 +80,8 @@ function requireMinPlan(minPlan) {
 
 // ---------- GEMINI CLIENT ----------
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const geminiModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'models/gemini-2.5-flash';
+const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
 
 // --- Gemini key sanity check (helps avoid opaque 500 internal_error) ---
 if (!process.env.GEMINI_API_KEY) {
