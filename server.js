@@ -79,13 +79,13 @@ function requireMinPlan(minPlan) {
 }
 
 // ---------- GEMINI CLIENT ----------
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'models/gemini-2.5-flash';
-const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
-
-// --- Gemini key sanity check (helps avoid opaque 500 internal_error) ---
-if (!process.env.GEMINI_API_KEY) {
-  console.warn('[WARN] GEMINI_API_KEY is missing. /api/gemini-text will return 500 until you set it on Render.');
+// Gemini config
+const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').replace(/^models\//, '');
+let _genAI = null;
+function getGeminiModel() {
+  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set');
+  if (!_genAI) _genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  return _genAI.getGenerativeModel({ model: GEMINI_MODEL });
 }
 
 // ---------- PLAN & LIMIT CONFIG ----------
@@ -359,7 +359,8 @@ app.post('/api/generate-script', authRequired, hydrateUserPlan, checkDailyLimit(
       return res.status(400).json({ error: 'prompt_required' });
     }
 
-    const result = await geminiModel.generateContent(prompt);
+    const model = getGeminiModel();
+    const result = await model.generateContent(prompt);
     const response = await result.response;
     const text = response.text();
 
@@ -384,12 +385,8 @@ app.post('/api/gemini-text', authRequired, hydrateUserPlan, checkDailyLimit(), a
       return res.status(400).json({ error: 'prompt_required' });
     }
 
-    // Fail fast with a clear message if GEMINI_API_KEY is not set
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({ error: 'missing_gemini_api_key' });
-    }
-
-    const result = await geminiModel.generateContent(prompt);
+    const model = getGeminiModel();
+    const result = await model.generateContent(prompt);
     const response = await result.response;
     const text = response.text();
 
@@ -402,17 +399,8 @@ app.post('/api/gemini-text', authRequired, hydrateUserPlan, checkDailyLimit(), a
       usage: usageInfo
     });
   } catch (err) {
-    // Log maximum useful info (Render logs)
-    const status = err?.status || err?.response?.status;
-    const details = err?.response?.data || err?.response || err;
-    console.error('gemini-text error:', { status, message: err?.message, details });
-
-    // In production, still keep response minimal but more actionable than "internal_error"
-    if (String(err?.message || '').toLowerCase().includes('api key') || String(details || '').toLowerCase().includes('api key')) {
-      return res.status(500).json({ error: 'invalid_gemini_api_key' });
-    }
-
-    return res.status(500).json({ error: 'internal_error' });
+    console.error('generate-script error', err);
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
