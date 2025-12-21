@@ -1,4 +1,4 @@
-// server.js
+// server.js (merged: Plan Spec + gateAI + Paddle price mapping + /api/me)
 require('dotenv').config();
 
 const express = require('express');
@@ -14,73 +14,50 @@ const app = express();
 // ---------- ENV ----------
 const PORT = process.env.PORT || 4000;
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
 
+// Paddle
 const PADDLE_ENV = process.env.PADDLE_ENV || 'sandbox'; // sandbox | live
 const PADDLE_API_KEY = process.env.PADDLE_API_KEY;
-const PADDLE_BASIC_PRICE_ID = process.env.PADDLE_BASIC_PRICE_ID;
-const PADDLE_PRO_PRICE_ID = process.env.PADDLE_PRO_PRICE_ID;
+const PADDLE_BASIC_PRICE_ID = process.env.PADDLE_BASIC_PRICE_ID; // e.g. pri_xxx
+const PADDLE_PRO_PRICE_ID = process.env.PADDLE_PRO_PRICE_ID;     // e.g. pri_yyy
 const CHECKOUT_SUCCESS_URL = process.env.CHECKOUT_SUCCESS_URL;
 const CHECKOUT_CANCEL_URL = process.env.CHECKOUT_CANCEL_URL;
+
+// Gemini
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'models/gemini-2.5-flash').replace(/^models\//, '');
 
 // ---------- BASIC APP SETUP ----------
 app.use(cors());
 app.use(express.json());
 
-// ---------- SUPABASE CLIENT ----------
+// ---------- SUPABASE CLIENT (Service Role) ----------
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+// ---------- PLAN SPEC (Single Source of Truth) ----------
+const PLAN_RULES = {
+  free:  { dailyLimit: 20,  monthlyLimit: null, unlimited: false, priceTHB: 0   },
+  basic: { dailyLimit: null, monthlyLimit: 200, unlimited: false, priceTHB: 190 },
+  pro:   { dailyLimit: null, monthlyLimit: null, unlimited: true,  priceTHB: 590 }
+};
 
-// --- Plan hydration: always read latest plan from DB (so upgrades apply immediately) ---
-async function hydrateUserPlan(req, res, next) {
-  try {
-    if (!req.user) req.user = {};
-    const email = req.user.email;
-    let plan = (req.user.plan || 'free').toLowerCase();
-    if (email) {
-      const { data, error } = await supabase
-        .from('users')
-        .select('plan')
-        .eq('email', email)
-        .maybeSingle();
-
-      if (!error && data?.plan) plan = String(data.plan).toLowerCase();
-    }
-    req.user.plan = plan;
-  } catch (e) {
-    if (!req.user) req.user = {};
-    req.user.plan = (req.user.plan || 'free').toLowerCase();
-  }
-  next();
+function normalizePlan(plan) {
+  const p = String(plan || 'free').toLowerCase();
+  return PLAN_RULES[p] ? p : 'free';
 }
 
-function planRank(plan) {
-  return plan === 'pro' ? 3 : plan === 'basic' ? 2 : 1; // free=1
-}
-
-function requireMinPlan(minPlan) {
-  const min = planRank(String(minPlan).toLowerCase());
-  return (req, res, next) => {
-    const current = planRank(String(req.user?.plan || 'free').toLowerCase());
-    if (current < min) {
-      return res.status(403).json({
-        error: 'upgrade_required',
-        message: `This feature requires ${minPlan} plan.`,
-        plan: req.user?.plan || 'free',
-      });
-    }
-    next();
-  };
+function mapPaddleToPlan(priceId) {
+  if (!priceId) return 'free';
+  if (priceId === PADDLE_BASIC_PRICE_ID) return 'basic';
+  if (priceId === PADDLE_PRO_PRICE_ID) return 'pro';
+  return 'free';
 }
 
 // ---------- GEMINI CLIENT ----------
-// Gemini config
-const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').replace(/^models\//, '');
 let _genAI = null;
 function getGeminiModel() {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set');
@@ -88,31 +65,22 @@ function getGeminiModel() {
   return _genAI.getGenerativeModel({ model: GEMINI_MODEL });
 }
 
-// ---------- PLAN & LIMIT CONFIG ----------
-const PLAN_LIMITS = {
-  free: 20,   // Free tier: 20 ครั้ง/วัน
-  basic: 20,  // เริ่มที่ 20 เหมือนกัน ปรับทีหลังง่าย
-  pro: null   // null = ไม่จำกัด
-};
-
-const PRICE_TO_PLAN = {
-  [PADDLE_BASIC_PRICE_ID]: 'basic',
-  [PADDLE_PRO_PRICE_ID]: 'pro'
-};
-
-// ---------- HELPER ----------
-function todayISODate() {
-  // ใช้วันที่แบบ UTC ง่าย ๆ
-  return new Date().toISOString().slice(0, 10);
+// ---------- TIME HELPERS ----------
+function isoDateUTC(d = new Date()) {
+  return new Date(d).toISOString().slice(0, 10); // YYYY-MM-DD
 }
 
+function monthRangeUTC(d = new Date()) {
+  const dt = new Date(d);
+  const start = new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), 1, 0, 0, 0));
+  const end = new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth() + 1, 1, 0, 0, 0));
+  return { startISO: isoDateUTC(start), endISO: isoDateUTC(end) };
+}
+
+// ---------- AUTH HELPERS ----------
 function signToken(user) {
   return jwt.sign(
-    {
-      id: user.id,
-      email: user.email,
-      plan: user.plan
-    },
+    { id: user.id, email: user.email, plan: normalizePlan(user.plan) },
     JWT_SECRET,
     { expiresIn: '7d' }
   );
@@ -121,10 +89,7 @@ function signToken(user) {
 function authRequired(req, res, next) {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-
-  if (!token) {
-    return res.status(401).json({ error: 'unauthorized: no token' });
-  }
+  if (!token) return res.status(401).json({ error: 'unauthorized: no token' });
 
   try {
     const payload = jwt.verify(token, JWT_SECRET);
@@ -132,83 +97,159 @@ function authRequired(req, res, next) {
     next();
   } catch (err) {
     console.error('JWT error', err);
-    res.status(401).json({ error: 'unauthorized: invalid token' });
+    return res.status(401).json({ error: 'unauthorized: invalid token' });
   }
 }
 
-async function getUsageRecord(userId, date) {
+// Always read latest plan from DB (so upgrades apply immediately)
+async function hydrateUser(req, res, next) {
+  try {
+    const userId = req.user?.id;
+    if (!userId) return next();
+
+    const { data, error } = await supabase
+      .from('users')
+      .select('id, email, plan, paddle_customer_id, paddle_subscription_id, created_at')
+      .eq('id', userId)
+      .single();
+
+    if (!error && data) {
+      req.user = {
+        ...req.user,
+        id: data.id,
+        email: data.email,
+        plan: normalizePlan(data.plan),
+        paddle_customer_id: data.paddle_customer_id || null,
+        paddle_subscription_id: data.paddle_subscription_id || null,
+        created_at: data.created_at || null
+      };
+    } else {
+      req.user.plan = normalizePlan(req.user.plan);
+    }
+  } catch (e) {
+    req.user.plan = normalizePlan(req.user?.plan);
+  }
+  next();
+}
+
+// ---------- USAGE (daily table) ----------
+async function getUsageDaily(userId, dateISO) {
   const { data, error } = await supabase
     .from('usage_daily')
-    .select('*')
+    .select('id, used')
     .eq('user_id', userId)
-    .eq('date', date)
+    .eq('date', dateISO)
     .maybeSingle();
 
   if (error) throw error;
-  return data;
+  return data || null;
 }
 
-async function incrementUsage(userId, date) {
-  const existing = await getUsageRecord(userId, date);
+async function incrementUsageDaily(userId, dateISO) {
+  const existing = await getUsageDaily(userId, dateISO);
   if (!existing) {
     const { error } = await supabase
       .from('usage_daily')
-      .insert({ user_id: userId, date, used: 1 });
+      .insert({ user_id: userId, date: dateISO, used: 1 });
     if (error) throw error;
     return 1;
-  } else {
-    const { data, error } = await supabase
-      .from('usage_daily')
-      .update({ used: existing.used + 1 })
-      .eq('id', existing.id)
-      .select()
-      .single();
-    if (error) throw error;
-    return data.used;
   }
+  const next = (existing.used || 0) + 1;
+  const { error } = await supabase
+    .from('usage_daily')
+    .update({ used: next })
+    .eq('id', existing.id);
+  if (error) throw error;
+  return next;
 }
 
-async function getUsageInfo(userId, plan) {
-  const limit = PLAN_LIMITS[plan] ?? null; // null = no limit
-  const date = todayISODate();
+async function getMonthUsed(userId) {
+  const { startISO, endISO } = monthRangeUTC(new Date());
+  const { data, error } = await supabase
+    .from('usage_daily')
+    .select('used')
+    .eq('user_id', userId)
+    .gte('date', startISO)
+    .lt('date', endISO);
 
-  const rec = await getUsageRecord(userId, date);
-  const used = rec ? rec.used : 0;
+  if (error) throw error;
+  return (data || []).reduce((sum, r) => sum + (r.used || 0), 0);
+}
+
+async function getUsageSummary(userId, plan) {
+  const p = normalizePlan(plan);
+  const rules = PLAN_RULES[p];
+
+  const today = isoDateUTC();
+  const todayRec = await getUsageDaily(userId, today);
+  const todayUsed = todayRec?.used || 0;
+
+  const monthUsed = await getMonthUsed(userId);
 
   return {
-    date,
-    used,
-    limit,
-    remaining: limit == null ? null : Math.max(limit - used, 0)
+    plan: p,
+    rules,
+    today: {
+      date: today,
+      used: todayUsed,
+      limit: rules.dailyLimit,
+      remaining: rules.dailyLimit == null ? null : Math.max(rules.dailyLimit - todayUsed, 0)
+    },
+    month: {
+      range: monthRangeUTC(new Date()),
+      used: monthUsed,
+      limit: rules.monthlyLimit,
+      remaining: rules.monthlyLimit == null ? null : Math.max(rules.monthlyLimit - monthUsed, 0)
+    }
   };
 }
 
-function checkDailyLimit() {
+// ---------- gateAI middleware (Feature Gate) ----------
+function gateAI() {
   return async (req, res, next) => {
     try {
-      const { id: userId, plan } = req.user;
+      const userId = req.user?.id;
+      const plan = normalizePlan(req.user?.plan);
+      const rules = PLAN_RULES[plan];
 
-      const info = await getUsageInfo(userId, plan);
+      if (!userId) return res.status(401).json({ ok: false, error: 'unauthorized' });
 
-      // ถ้า plan ไม่จำกัดก็ผ่านเลย
-      if (info.limit == null) {
-        req.usageInfo = info;
+      // Pro: unlimited
+      if (rules.unlimited) {
+        req.usage = await getUsageSummary(userId, plan);
         return next();
       }
 
-      if (info.used >= info.limit) {
-        return res.status(429).json({
-          error: 'daily_limit_reached',
-          message: `คุณใช้ครบ ${info.limit} ครั้ง/วันแล้ว โปรดรอวันถัดไป หรืออัปเกรดแพ็กเกจ`,
-          usage: info
+      // Daily / Monthly checks
+      const usage = await getUsageSummary(userId, plan);
+
+      if (rules.dailyLimit != null && usage.today.used >= rules.dailyLimit) {
+        return res.status(402).json({
+          ok: false,
+          error: 'limit_reached',
+          scope: 'daily',
+          upgrade_required: true,
+          usage
         });
       }
 
-      req.usageInfo = info;
+      if (rules.monthlyLimit != null && usage.month.used >= rules.monthlyLimit) {
+        return res.status(402).json({
+          ok: false,
+          error: 'limit_reached',
+          scope: 'monthly',
+          upgrade_required: true,
+          usage
+        });
+      }
+
+      // Consume 1 usage (store in daily table; monthly is SUM(daily))
+      await incrementUsageDaily(userId, isoDateUTC());
+      req.usage = await getUsageSummary(userId, plan);
       next();
     } catch (err) {
-      console.error('checkDailyLimit error', err);
-      res.status(500).json({ error: 'internal_error' });
+      console.error('gateAI error', err);
+      res.status(500).json({ ok: false, error: 'internal_error' });
     }
   };
 }
@@ -226,9 +267,7 @@ app.get('/api/health', (req, res) => {
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    if (!email || !password) {
-      return res.status(400).json({ error: 'email_and_password_required' });
-    }
+    if (!email || !password) return res.status(400).json({ error: 'email_and_password_required' });
 
     const normalizedEmail = String(email).trim().toLowerCase();
 
@@ -240,20 +279,14 @@ app.post('/api/auth/register', async (req, res) => {
       .maybeSingle();
 
     if (existingErr) throw existingErr;
-    if (existing) {
-      return res.status(409).json({ error: 'email_already_registered' });
-    }
+    if (existing) return res.status(409).json({ error: 'email_already_registered' });
 
     const password_hash = await bcrypt.hash(password, 10);
 
     const { data: newUser, error: insertErr } = await supabase
       .from('users')
-      .insert({
-        email: normalizedEmail,
-        password_hash,
-        plan: 'free'
-      })
-      .select()
+      .insert({ email: normalizedEmail, password_hash, plan: 'free' })
+      .select('id, email, plan, created_at, paddle_customer_id, paddle_subscription_id')
       .single();
 
     if (insertErr) throw insertErr;
@@ -262,11 +295,7 @@ app.post('/api/auth/register', async (req, res) => {
 
     res.json({
       token,
-      user: {
-        id: newUser.id,
-        email: newUser.email,
-        plan: newUser.plan
-      }
+      user: { id: newUser.id, email: newUser.email, plan: normalizePlan(newUser.plan) }
     });
   } catch (err) {
     console.error('register error', err);
@@ -278,9 +307,7 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    if (!email || !password) {
-      return res.status(400).json({ error: 'email_and_password_required' });
-    }
+    if (!email || !password) return res.status(400).json({ error: 'email_and_password_required' });
 
     const normalizedEmail = String(email).trim().toLowerCase();
 
@@ -290,24 +317,16 @@ app.post('/api/auth/login', async (req, res) => {
       .eq('email', normalizedEmail)
       .single();
 
-    if (error || !user) {
-      return res.status(401).json({ error: 'invalid_credentials' });
-    }
+    if (error || !user) return res.status(401).json({ error: 'invalid_credentials' });
 
     const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) {
-      return res.status(401).json({ error: 'invalid_credentials' });
-    }
+    if (!valid) return res.status(401).json({ error: 'invalid_credentials' });
 
     const token = signToken(user);
 
     res.json({
       token,
-      user: {
-        id: user.id,
-        email: user.email,
-        plan: user.plan
-      }
+      user: { id: user.id, email: user.email, plan: normalizePlan(user.plan) }
     });
   } catch (err) {
     console.error('login error', err);
@@ -315,144 +334,98 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Current user
-app.get('/api/me', authRequired, async (req, res) => {
+// ---- Current user (/api/me) ----
+app.get('/api/me', authRequired, hydrateUser, async (req, res) => {
   try {
-    const { id } = req.user;
+    const user = {
+      id: req.user.id,
+      email: req.user.email,
+      plan: normalizePlan(req.user.plan),
+      created_at: req.user.created_at,
+      paddle_customer_id: req.user.paddle_customer_id || null,
+      paddle_subscription_id: req.user.paddle_subscription_id || null
+    };
 
-    const { data: user, error } = await supabase
-      .from('users')
-      .select('id, email, plan, created_at, paddle_customer_id, paddle_subscription_id')
-      .eq('id', id)
-      .single();
+    const usage = await getUsageSummary(user.id, user.plan);
 
-    if (error || !user) {
-      return res.status(404).json({ error: 'user_not_found' });
-    }
+    // Helpful for frontend (show correct price ids)
+    const paddle = {
+      env: PADDLE_ENV,
+      basic_price_id: PADDLE_BASIC_PRICE_ID || null,
+      pro_price_id: PADDLE_PRO_PRICE_ID || null
+    };
 
-    const usage = await getUsageInfo(user.id, user.plan);
-
-    res.json({ user, usage });
+    res.json({ ok: true, user, usage, plans: PLAN_RULES, paddle });
   } catch (err) {
     console.error('/api/me error', err);
-    res.status(500).json({ error: 'internal_error' });
+    res.status(500).json({ ok: false, error: 'internal_error' });
   }
 });
 
-// Usage info
-app.get('/api/usage', authRequired, async (req, res) => {
-  try {
-    const info = await getUsageInfo(req.user.id, req.user.plan);
-    res.json(info);
-  } catch (err) {
-    console.error('/api/usage error', err);
-    res.status(500).json({ error: 'internal_error' });
-  }
-});
-
-// ---- GEMINI SCRIPT GENERATION ----
-// ตัวอย่าง endpoint ใช้ limit 20 ครั้ง/วัน
-app.post('/api/generate-script', authRequired, hydrateUserPlan, checkDailyLimit(), async (req, res) => {
+// ---- GEMINI ENDPOINTS (gated) ----
+app.post('/api/generate-script', authRequired, hydrateUser, gateAI(), async (req, res) => {
   try {
     const { prompt } = req.body || {};
-    if (!prompt) {
-      return res.status(400).json({ error: 'prompt_required' });
-    }
+    if (!prompt) return res.status(400).json({ ok: false, error: 'prompt_required' });
 
     const model = getGeminiModel();
     const result = await model.generateContent(prompt);
     const response = await result.response;
     const text = response.text();
 
-    // นับ usage ครั้งนี้
-    const used = await incrementUsage(req.user.id, todayISODate());
-    const usageInfo = await getUsageInfo(req.user.id, req.user.plan);
-
-    res.json({
-      text,
-      usage: usageInfo
-    });
+    res.json({ ok: true, text, usage: req.usage });
   } catch (err) {
     console.error('generate-script error', err);
-    res.status(500).json({ error: 'internal_error' });
+    res.status(500).json({ ok: false, error: 'internal_error' });
   }
 });
 
-app.post('/api/gemini-text', authRequired, hydrateUserPlan, checkDailyLimit(), async (req, res) => {
+app.post('/api/gemini-text', authRequired, hydrateUser, gateAI(), async (req, res) => {
   try {
     const { prompt } = req.body || {};
-    if (!prompt) {
-      return res.status(400).json({ error: 'prompt_required' });
-    }
+    if (!prompt) return res.status(400).json({ ok: false, error: 'prompt_required' });
 
     const model = getGeminiModel();
     const result = await model.generateContent(prompt);
     const response = await result.response;
     const text = response.text();
 
-    // นับ usage ครั้งนี้
-    const used = await incrementUsage(req.user.id, todayISODate());
-    const usageInfo = await getUsageInfo(req.user.id, req.user.plan);
-
-    res.json({
-      text,
-      usage: usageInfo
-    });
+    res.json({ ok: true, text, usage: req.usage });
   } catch (err) {
-    console.error('generate-script error', err);
-    res.status(500).json({ error: 'internal_error' });
+    console.error('gemini-text error', err);
+    res.status(500).json({ ok: false, error: 'internal_error' });
   }
 });
-
 
 // ---- PADDLE CHECKOUT (ลูกค้าเริ่มจ่ายเงิน) ----
-app.post('/api/paddle/create-checkout', authRequired, async (req, res) => {
+app.post('/api/paddle/create-checkout', authRequired, hydrateUser, async (req, res) => {
   try {
     const { priceId } = req.body || {};
-    if (!priceId) {
-      return res.status(400).json({ error: 'priceId_required' });
-    }
+    if (!priceId) return res.status(400).json({ error: 'priceId_required' });
 
-    if (!PADDLE_API_KEY) {
-      return res.status(500).json({ error: 'paddle_not_configured' });
-    }
+    if (!PADDLE_API_KEY) return res.status(500).json({ error: 'paddle_not_configured' });
 
-    const plan = PRICE_TO_PLAN[priceId];
-    if (!plan) {
-      return res.status(400).json({ error: 'unknown_price_id' });
-    }
+    const plan = mapPaddleToPlan(priceId);
+    if (plan === 'free') return res.status(400).json({ error: 'unknown_price_id' });
 
-    const apiBase =
-      PADDLE_ENV === 'live'
-        ? 'https://api.paddle.com'
-        : 'https://sandbox-api.paddle.com';
+    const apiBase = (PADDLE_ENV === 'live') ? 'https://api.paddle.com' : 'https://sandbox-api.paddle.com';
 
     const body = {
       items: [{ price_id: priceId, quantity: 1 }],
-      customer: {
-        email: req.user.email
-      },
-      metadata: {
-        user_id: req.user.id
-      },
+      customer: { email: req.user.email },
+      metadata: { user_id: req.user.id, requested_plan: plan },
       success_url: CHECKOUT_SUCCESS_URL,
       cancel_url: CHECKOUT_CANCEL_URL
     };
 
-    const response = await axios.post(
-      `${apiBase}/checkout/sessions`,
-      body,
-      {
-        headers: {
-          Authorization: `Bearer ${PADDLE_API_KEY}`,
-          'Content-Type': 'application/json'
-        }
+    const response = await axios.post(`${apiBase}/checkout/sessions`, body, {
+      headers: {
+        Authorization: `Bearer ${PADDLE_API_KEY}`,
+        'Content-Type': 'application/json'
       }
-    );
+    });
 
     const session = response.data;
-
-    // Paddle Billing v2 จะส่ง checkout_url / id กลับมา
     const checkoutUrl = session?.data?.checkout_url || session?.checkout_url;
 
     res.json({
@@ -466,54 +439,79 @@ app.post('/api/paddle/create-checkout', authRequired, async (req, res) => {
 });
 
 // ---- PADDLE WEBHOOK ----
-// NOTE: โค้ดนี้เป็น template เบื้องต้น ยังไม่ได้ verify signature
-// แนะนำเปิด log แล้วดู payload จริงจาก Paddle แล้วปรับ field ให้ตรง
+// NOTE: template only; signature verification is strongly recommended for production.
 app.post('/api/paddle/webhook', async (req, res) => {
   try {
-    const event = req.body;
+    const event = req.body || {};
     const type = event.event_type || event.type;
 
     console.log('Paddle webhook:', type);
 
-    // ตัวอย่างสำหรับ Billing v2: subscription.activated / subscription.updated
-    if (
-      type === 'subscription.activated' ||
-      type === 'subscription.updated'
-    ) {
-      const data = event.data || event;
-      const priceId =
-        data.items?.[0]?.price?.id ||
-        data.items?.[0]?.price_id ||
-        data.price_id;
+    // Billing v2: subscription.activated / subscription.updated / subscription.canceled
+    const handledTypes = new Set([
+      'subscription.activated',
+      'subscription.updated',
+      'subscription.canceled',
+      'subscription.paused',
+      'subscription.resumed',
+      'subscription.past_due'
+    ]);
 
-      const plan = PRICE_TO_PLAN[priceId];
+    if (!handledTypes.has(type)) {
+      return res.status(200).send('ok');
+    }
 
-      const email =
-        data.customer?.email || data.customer_email || data.user_email;
+    const data = event.data || event;
 
-      if (plan && email) {
-        const { data: user, error } = await supabase
-          .from('users')
-          .upsert(
-            {
-              email: email.toLowerCase(),
-              plan,
-              paddle_customer_id: customerId || null,
-              paddle_subscription_id: subscriptionId || null,
-            },
-            { onConflict: 'email' }
-          )
-          .select()
-          .maybeSingle();
+    const priceId =
+      data.items?.[0]?.price?.id ||
+      data.items?.[0]?.price_id ||
+      data.price_id ||
+      data?.subscription?.items?.[0]?.price?.id;
 
-        if (error) {
-          console.error('supabase update error from webhook', error);
-        } else {
-          console.log('Updated user from webhook:', user.email, 'plan:', user.plan);
-        }
-      } else {
-        console.warn('Webhook plan/email not resolved', { priceId, plan, email });
-      }
+    const email =
+      data.customer?.email ||
+      data.customer_email ||
+      data.user_email ||
+      data?.subscription?.customer?.email;
+
+    const customerId =
+      data.customer?.id ||
+      data.customer_id ||
+      data?.subscription?.customer?.id ||
+      null;
+
+    const subscriptionId =
+      data.id ||
+      data.subscription_id ||
+      data?.subscription?.id ||
+      null;
+
+    // Decide plan: if canceled/past_due -> free, else map from priceId.
+    let plan = mapPaddleToPlan(priceId);
+    if (type === 'subscription.canceled' || type === 'subscription.past_due') {
+      plan = 'free';
+    }
+
+    if (email) {
+      const { data: user, error } = await supabase
+        .from('users')
+        .upsert(
+          {
+            email: String(email).toLowerCase(),
+            plan,
+            paddle_customer_id: customerId,
+            paddle_subscription_id: subscriptionId
+          },
+          { onConflict: 'email' }
+        )
+        .select()
+        .maybeSingle();
+
+      if (error) console.error('supabase update error from webhook', error);
+      else console.log('Updated user from webhook:', user?.email, 'plan:', user?.plan);
+    } else {
+      console.warn('Webhook email not resolved', { type, priceId, customerId, subscriptionId });
     }
 
     res.status(200).send('ok');
