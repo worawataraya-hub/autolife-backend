@@ -90,10 +90,11 @@ function getGeminiModel() {
 
 // ---------- PLAN & LIMIT CONFIG ----------
 const PLAN_LIMITS = {
-  free: 20,   // Free tier: 20 ครั้ง/วัน
-  basic: 20,  // เริ่มที่ 20 เหมือนกัน ปรับทีหลังง่าย
-  pro: null   // null = ไม่จำกัด
+  free: { daily: Number(process.env.DAILY_FREE_LIMIT || 20), monthly: null },
+  basic: { daily: null, monthly: Number(process.env.MONTHLY_BASIC_LIMIT || 300) },
+  pro: { daily: null, monthly: null } // unlimited
 };
+
 
 const PRICE_TO_PLAN = {
   [PADDLE_BASIC_PRICE_ID]: 'basic',
@@ -148,70 +149,130 @@ async function getUsageRecord(userId, date) {
   return data;
 }
 
-async function incrementUsage(userId, date) {
-  const existing = await getUsageRecord(userId, date);
-  if (!existing) {
-    const { error } = await supabase
-      .from('usage_daily')
-      .insert({ user_id: userId, date, used: 1 });
-    if (error) throw error;
-    return 1;
-  } else {
-    const { data, error } = await supabase
-      .from('usage_daily')
-      .update({ used: existing.used + 1 })
-      .eq('id', existing.id)
-      .select()
-      .single();
-    if (error) throw error;
-    return data.used;
+async function getMonthlyUsageRecord(userId, monthKey) {
+  // usage_monthly schema: user_id TEXT, month TEXT (YYYY-MM), count INT, updated_at TIMESTAMPTZ
+  const { data, error } = await supabase
+    .from('usage_monthly')
+    .select('count')
+    .eq('user_id', userId)
+    .eq('month', monthKey)
+    .maybeSingle();
+
+  if (error) {
+    // If table doesn't exist yet or other error, fail closed with 0 to avoid blocking all users.
+    console.warn('getMonthlyUsageRecord error', error?.message || error);
+    return 0;
   }
+  return data?.count || 0;
 }
 
-async function getUsageInfo(userId, plan) {
-  const limit = PLAN_LIMITS[plan] ?? null; // null = no limit
-  const date = todayISODate();
+async function incrementMonthlyUsage(userId, monthKey) {
+  const current = await getMonthlyUsageRecord(userId, monthKey);
+  const next = current + 1;
 
-  const rec = await getUsageRecord(userId, date);
-  const used = rec ? rec.used : 0;
+  const { error } = await supabase
+    .from('usage_monthly')
+    .upsert({ user_id: userId, month: monthKey, count: next }, { onConflict: 'user_id,month' });
+
+  if (error) console.warn('incrementMonthlyUsage error', error?.message || error);
+  return next;
+}
+
+async function incrementUsage(userId, date) {
+  const { data, error } = await supabase
+    .from('usage_daily')
+    .select('used')
+    .eq('user_id', userId)
+    .eq('date', date)
+    .maybeSingle();
+
+  if (error) {
+    console.warn('incrementUsage daily error', error?.message || error);
+    return 0;
+  }
+
+  const next = (data?.used || 0) + 1;
+  const { error: upsertErr } = await supabase
+    .from('usage_daily')
+    .upsert({ user_id: userId, date, used: next }, { onConflict: 'user_id,date' });
+
+  if (upsertErr) console.warn('incrementUsage daily upsert error', upsertErr?.message || upsertErr);
+  return next;
+}
+
+async function incrementUsageForPlan(userId, plan) {
+  const today = new Date().toISOString().slice(0, 10);
+  const month = new Date().toISOString().slice(0, 7);
+
+  if (plan === 'basic') {
+    return { monthly: await incrementMonthlyUsage(userId, month) };
+  }
+  if (plan === 'pro') {
+    return {};
+  }
+  // default: free -> daily
+  return { daily: await incrementUsage(userId, today) };
+}
+
+
+async function getUsageInfo(userId, plan) {
+  const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free;
+
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const month = new Date().toISOString().slice(0, 7);  // YYYY-MM
+
+  const dailyCount = await getUsageRecord(userId, today);
+  const monthlyCount = await getMonthlyUsageRecord(userId, month);
 
   return {
-    date,
-    used,
-    limit,
-    remaining: limit == null ? null : Math.max(limit - used, 0)
+    plan,
+    today,
+    month,
+    daily: { used: dailyCount, limit: limits.daily },
+    monthly: { used: monthlyCount, limit: limits.monthly }
   };
 }
 
-function checkDailyLimit() {
+
+function checkUsageLimit() {
   return async (req, res, next) => {
     try {
-      const { id: userId, plan } = req.user;
+      const plan = (req.user?.plan || 'free').toLowerCase();
+      const info = await getUsageInfo(req.user.id, plan);
+      const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free;
 
-      const info = await getUsageInfo(userId, plan);
-
-      // ถ้า plan ไม่จำกัดก็ผ่านเลย
-      if (info.limit == null) {
-        req.usageInfo = info;
-        return next();
+      // free -> daily limit
+      if (limits.daily != null) {
+        if (info.daily.used >= limits.daily) {
+          return res.status(429).json({
+            error: 'daily_limit_reached',
+            message: `Daily limit reached (${limits.daily}/day). Please upgrade.`,
+            usage: info
+          });
+        }
       }
 
-      if (info.used >= info.limit) {
-        return res.status(429).json({
-          error: 'daily_limit_reached',
-          message: `คุณใช้ครบ ${info.limit} ครั้ง/วันแล้ว โปรดรอวันถัดไป หรืออัปเกรดแพ็กเกจ`,
-          usage: info
-        });
+      // basic -> monthly limit
+      if (limits.monthly != null) {
+        if (info.monthly.used >= limits.monthly) {
+          return res.status(429).json({
+            error: 'monthly_limit_reached',
+            message: `Monthly limit reached (${limits.monthly}/month). Please upgrade.`,
+            usage: info
+          });
+        }
       }
 
       req.usageInfo = info;
       next();
-    } catch (err) {
-      console.error('checkDailyLimit error', err);
-      res.status(500).json({ error: 'internal_error' });
+    } catch (e) {
+      console.error('checkUsageLimit error', e);
+      // fail open (do not block AI) if usage system fails
+      next();
     }
   };
 }
+
 
 // ---------- ROUTES ----------
 
@@ -352,7 +413,7 @@ app.get('/api/usage', authRequired, async (req, res) => {
 
 // ---- GEMINI SCRIPT GENERATION ----
 // ตัวอย่าง endpoint ใช้ limit 20 ครั้ง/วัน
-app.post('/api/generate-script', authRequired, hydrateUserPlan, checkDailyLimit(), async (req, res) => {
+app.post('/api/generate-script', authRequired, hydrateUserPlan, checkUsageLimit(), async (req, res) => {
   try {
     const { prompt } = req.body || {};
     if (!prompt) {
@@ -378,7 +439,7 @@ app.post('/api/generate-script', authRequired, hydrateUserPlan, checkDailyLimit(
   }
 });
 
-app.post('/api/gemini-text', authRequired, hydrateUserPlan, checkDailyLimit(), async (req, res) => {
+app.post('/api/gemini-text', authRequired, hydrateUserPlan, checkUsageLimit(), async (req, res) => {
   try {
     const { prompt } = req.body || {};
     if (!prompt) {
