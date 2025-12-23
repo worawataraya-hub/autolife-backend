@@ -30,7 +30,7 @@ const CHECKOUT_CANCEL_URL = process.env.CHECKOUT_CANCEL_URL;
 
 // ---------- BASIC APP SETUP ----------
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 // ---------- SUPABASE CLIENT ----------
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -102,9 +102,27 @@ const PRICE_TO_PLAN = {
 };
 
 // ---------- HELPER ----------
+// Thailand timezone helpers (Asia/Bangkok)
+const TZ = 'Asia/Bangkok';
+
+// Returns YYYY-MM-DD in Thailand time
+function thaiDateKey(d = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: TZ,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(d);
+}
+
+// Returns YYYY-MM in Thailand time
+function thaiMonthKey(d = new Date()) {
+  return thaiDateKey(d).slice(0, 7);
+}
+
+// Backwards-compatible alias (used by older code paths)
 function todayISODate() {
-  // ใช้วันที่แบบ UTC ง่าย ๆ
-  return new Date().toISOString().slice(0, 10);
+  return thaiDateKey();
 }
 
 function signToken(user) {
@@ -140,13 +158,13 @@ function authRequired(req, res, next) {
 async function getUsageRecord(userId, date) {
   const { data, error } = await supabase
     .from('usage_daily')
-    .select('*')
+    .select('used')
     .eq('user_id', userId)
     .eq('date', date)
     .maybeSingle();
 
   if (error) throw error;
-  return data;
+  return data?.used || 0;
 }
 
 async function getMonthlyUsageRecord(userId, monthKey) {
@@ -201,17 +219,21 @@ async function incrementUsage(userId, date) {
 }
 
 async function incrementUsageForPlan(userId, plan) {
-  const today = new Date().toISOString().slice(0, 10);
-  const month = new Date().toISOString().slice(0, 7);
+  const p = String(plan || 'free').toLowerCase();
+  const today = thaiDateKey();
+  const month = thaiMonthKey();
 
-  if (plan === 'basic') {
-    return { monthly: await incrementMonthlyUsage(userId, month) };
+  if (p === 'basic') {
+    const monthly = await incrementMonthlyUsage(userId, month);
+    return { monthly };
   }
-  if (plan === 'pro') {
+  if (p === 'pro') {
+    // unlimited: do not count usage
     return {};
   }
   // default: free -> daily
-  return { daily: await incrementUsage(userId, today) };
+  const daily = await incrementUsage(userId, today);
+  return { daily };
 }
 
 
@@ -237,38 +259,58 @@ async function getUsageInfo(userId, plan) {
 function checkUsageLimit() {
   return async (req, res, next) => {
     try {
-      const plan = (req.user?.plan || 'free').toLowerCase();
+      const plan = String(req.user?.plan || 'free').toLowerCase();
+
+      // PRO: unlimited (skip quota checks)
+      if (plan === 'pro') {
+        req.usageInfo = await getUsageInfo(req.user.id, plan);
+        console.log({
+          user: req.user.email,
+          plan,
+          usedToday: req.usageInfo.daily.used,
+          usedMonth: req.usageInfo.monthly.used
+        });
+        return next();
+      }
+
       const info = await getUsageInfo(req.user.id, plan);
       const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free;
 
-      // free -> daily limit
-      if (limits.daily != null) {
-        if (info.daily.used >= limits.daily) {
-          return res.status(429).json({
-            error: 'daily_limit_reached',
-            message: `Daily limit reached (${limits.daily}/day). Please upgrade.`,
-            usage: info
-          });
-        }
+      // FREE -> daily limit
+      if (limits.daily != null && info.daily.used >= limits.daily) {
+        return res.status(402).json({
+          error: 'daily_limit_reached',
+          message: `Daily limit reached (${limits.daily}/day). Please upgrade.`,
+          usage: info
+        });
       }
 
-      // basic -> monthly limit
-      if (limits.monthly != null) {
-        if (info.monthly.used >= limits.monthly) {
-          return res.status(429).json({
-            error: 'monthly_limit_reached',
-            message: `Monthly limit reached (${limits.monthly}/month). Please upgrade.`,
-            usage: info
-          });
-        }
+      // BASIC -> monthly limit
+      if (limits.monthly != null && info.monthly.used >= limits.monthly) {
+        return res.status(402).json({
+          error: 'monthly_limit_reached',
+          message: `Monthly limit reached (${limits.monthly}/month). Please upgrade.`,
+          usage: info
+        });
       }
 
       req.usageInfo = info;
+
+      console.log({
+        user: req.user.email,
+        plan,
+        usedToday: info.daily.used,
+        usedMonth: info.monthly.used
+      });
+
       next();
     } catch (e) {
       console.error('checkUsageLimit error', e);
-      // fail open (do not block AI) if usage system fails
-      next();
+      // If quota system fails, respond 429 to encourage retry rather than consuming Gemini calls
+      return res.status(429).json({
+        error: 'system_busy',
+        message: 'ระบบกำลังหนาแน่น กรุณาลองใหม่อีกครั้ง'
+      });
     }
   };
 }
@@ -426,7 +468,7 @@ app.post('/api/generate-script', authRequired, hydrateUserPlan, checkUsageLimit(
     const text = response.text();
 
     // นับ usage ครั้งนี้
-    const used = await incrementUsage(req.user.id, todayISODate());
+    await incrementUsageForPlan(req.user.id, req.user.plan);
     const usageInfo = await getUsageInfo(req.user.id, req.user.plan);
 
     res.json({
@@ -452,7 +494,7 @@ app.post('/api/gemini-text', authRequired, hydrateUserPlan, checkUsageLimit(), a
     const text = response.text();
 
     // นับ usage ครั้งนี้
-    const used = await incrementUsage(req.user.id, todayISODate());
+    await incrementUsageForPlan(req.user.id, req.user.plan);
     const usageInfo = await getUsageInfo(req.user.id, req.user.plan);
 
     res.json({
@@ -527,21 +569,45 @@ app.post('/api/paddle/create-checkout', authRequired, async (req, res) => {
 });
 
 // ---- PADDLE WEBHOOK ----
-// NOTE: โค้ดนี้เป็น template เบื้องต้น ยังไม่ได้ verify signature
-// แนะนำเปิด log แล้วดู payload จริงจาก Paddle แล้วปรับ field ให้ตรง
+// Verifies signature if PADDLE_WEBHOOK_SECRET is set (recommended).
+// Paddle sends header: 'paddle-signature' (HMAC SHA256 over raw body).
+const crypto = require('crypto');
+const PADDLE_WEBHOOK_SECRET = process.env.PADDLE_WEBHOOK_SECRET;
+
+// NOTE: Use raw body for signature verification
 app.post('/api/paddle/webhook', async (req, res) => {
   try {
-    const event = req.body;
+    const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body || {}), 'utf-8');
+    const signature = req.headers['paddle-signature'];
+
+    if (PADDLE_WEBHOOK_SECRET) {
+      if (!signature) {
+        return res.status(400).json({ error: 'missing_paddle_signature' });
+      }
+      const expected = crypto
+        .createHmac('sha256', PADDLE_WEBHOOK_SECRET)
+        .update(rawBody)
+        .digest('hex');
+
+      // Some Paddle setups send multiple signatures; accept if expected appears.
+      const sigStr = String(signature);
+      const ok = sigStr.includes(expected);
+      if (!ok) {
+        console.warn('Paddle webhook signature mismatch');
+        return res.status(401).json({ error: 'invalid_signature' });
+      }
+    } else {
+      console.warn('PADDLE_WEBHOOK_SECRET is not set; skipping signature verification.');
+    }
+
+    const event = typeof req.body === 'object' ? req.body : JSON.parse(rawBody.toString('utf-8'));
     const type = event.event_type || event.type;
 
     console.log('Paddle webhook:', type);
 
-    // ตัวอย่างสำหรับ Billing v2: subscription.activated / subscription.updated
-    if (
-      type === 'subscription.activated' ||
-      type === 'subscription.updated'
-    ) {
+    if (type === 'subscription.activated' || type === 'subscription.updated' || type === 'transaction.completed') {
       const data = event.data || event;
+
       const priceId =
         data.items?.[0]?.price?.id ||
         data.items?.[0]?.price_id ||
@@ -550,17 +616,31 @@ app.post('/api/paddle/webhook', async (req, res) => {
       const plan = PRICE_TO_PLAN[priceId];
 
       const email =
-        data.customer?.email || data.customer_email || data.user_email;
+        data.customer?.email ||
+        data.customer_email ||
+        data.user_email ||
+        data.customer?.id && null;
+
+      const customerId =
+        data.customer?.id ||
+        data.customer_id ||
+        null;
+
+      const subscriptionId =
+        data.id ||
+        data.subscription_id ||
+        data.subscription?.id ||
+        null;
 
       if (plan && email) {
         const { data: user, error } = await supabase
           .from('users')
           .upsert(
             {
-              email: email.toLowerCase(),
+              email: String(email).toLowerCase(),
               plan,
-              paddle_customer_id: customerId || null,
-              paddle_subscription_id: subscriptionId || null,
+              paddle_customer_id: customerId,
+              paddle_subscription_id: subscriptionId,
             },
             { onConflict: 'email' }
           )
@@ -570,17 +650,17 @@ app.post('/api/paddle/webhook', async (req, res) => {
         if (error) {
           console.error('supabase update error from webhook', error);
         } else {
-          console.log('Updated user from webhook:', user.email, 'plan:', user.plan);
+          console.log('Updated user from webhook:', user?.email, 'plan:', user?.plan);
         }
       } else {
         console.warn('Webhook plan/email not resolved', { priceId, plan, email });
       }
     }
 
-    res.status(200).send('ok');
+    return res.status(200).send('ok');
   } catch (err) {
     console.error('webhook error', err);
-    res.status(500).send('error');
+    return res.status(500).send('error');
   }
 });
 
