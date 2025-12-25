@@ -62,7 +62,39 @@ must("CHECKOUT_CANCEL_URL", CHECKOUT_CANCEL_URL);
 must("GEMINI_API_KEY", GEMINI_API_KEY);
 
 // ---------- MIDDLEWARE ----------
-app.use(cors());
+// CORS: allow Netlify frontend + local dev.
+// Set CORS_ORIGINS as comma-separated list (recommended) to be strict in production.
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// sensible defaults (your known frontends)
+if (!ALLOWED_ORIGINS.length) {
+  ALLOWED_ORIGINS.push(
+    "https://autolife-ai.netlify.app",
+    "https://autolife-ai.netlify.app/",
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://localhost:5500",
+  );
+}
+
+const corsOptions = {
+  origin(origin, cb) {
+    // allow server-to-server / curl (no Origin)
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  maxAge: 86400,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 const jsonParser = express.json({
   limit: "2mb",
   verify: (req, res, buf) => {
@@ -83,18 +115,22 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 // --- Usage table column compatibility (older DB might use 'date'/'month' instead of 'date_key'/'month_key') ---
 let DAILY_KEY_COL = process.env.DAILY_KEY_COL || 'date_key';
 let MONTH_KEY_COL = process.env.MONTH_KEY_COL || 'month_key';
+let DAILY_COUNT_COL = process.env.DAILY_COUNT_COL || 'count';
+let MONTH_COUNT_COL = process.env.MONTH_COUNT_COL || 'count';
 let _usageColsProbed = false;
+
+const COUNT_CANDIDATES = ['count', 'used', 'used_count', 'usage', 'usage_count', 'calls', 'call_count'];
 
 async function probeUsageColumns() {
   if (_usageColsProbed) return;
   _usageColsProbed = true;
 
-  // Probe daily
+  // Probe daily (key column + count column)
   try {
     const probeVal = '1900-01-01';
     const { error } = await supabase
       .from('usage_daily')
-      .select('count')
+      .select(DAILY_COUNT_COL)
       .eq('user_id', 'probe')
       .eq(DAILY_KEY_COL, probeVal)
       .limit(1);
@@ -102,20 +138,36 @@ async function probeUsageColumns() {
     if (error && error.code === '42703' && String(error.message || '').includes('date_key')) {
       DAILY_KEY_COL = 'date';
       console.warn('[probe] usage_daily missing date_key; falling back to column: date');
-    } else if (error && error.code === '42703') {
-      // generic missing column
-      console.warn('[probe] usage_daily column probe error:', error);
+    }
+
+    // If count column missing, try candidates
+    if (error && error.code === '42703' && String(error.message || '').toLowerCase().includes("'count'")) {
+      for (const cand of COUNT_CANDIDATES) {
+        try {
+          const { error: e2 } = await supabase
+            .from('usage_daily')
+            .select(cand)
+            .eq('user_id', 'probe')
+            .eq(DAILY_KEY_COL, probeVal)
+            .limit(1);
+          if (!e2) {
+            DAILY_COUNT_COL = cand;
+            console.warn(`[probe] usage_daily missing count; falling back to column: ${cand}`);
+            break;
+          }
+        } catch {}
+      }
     }
   } catch (e) {
     console.warn('[probe] usage_daily probe exception:', e?.message || e);
   }
 
-  // Probe monthly
+  // Probe monthly (key column + count column)
   try {
     const probeVal = '1900-01';
     const { error } = await supabase
       .from('usage_monthly')
-      .select('count')
+      .select(MONTH_COUNT_COL)
       .eq('user_id', 'probe')
       .eq(MONTH_KEY_COL, probeVal)
       .limit(1);
@@ -123,8 +175,24 @@ async function probeUsageColumns() {
     if (error && error.code === '42703' && String(error.message || '').includes('month_key')) {
       MONTH_KEY_COL = 'month';
       console.warn('[probe] usage_monthly missing month_key; falling back to column: month');
-    } else if (error && error.code === '42703') {
-      console.warn('[probe] usage_monthly column probe error:', error);
+    }
+
+    if (error && error.code === '42703' && String(error.message || '').toLowerCase().includes("'count'")) {
+      for (const cand of COUNT_CANDIDATES) {
+        try {
+          const { error: e2 } = await supabase
+            .from('usage_monthly')
+            .select(cand)
+            .eq('user_id', 'probe')
+            .eq(MONTH_KEY_COL, probeVal)
+            .limit(1);
+          if (!e2) {
+            MONTH_COUNT_COL = cand;
+            console.warn(`[probe] usage_monthly missing count; falling back to column: ${cand}`);
+            break;
+          }
+        } catch {}
+      }
     }
   } catch (e) {
     console.warn('[probe] usage_monthly probe exception:', e?.message || e);
@@ -141,13 +209,13 @@ async function getDailyCount(userId, dateKey) {
   await probeUsageColumns();
   const { data, error } = await supabase
     .from('usage_daily')
-    .select('count')
+    .select(DAILY_COUNT_COL)
     .eq('user_id', userId)
     .eq(DAILY_KEY_COL, dateKey)
     .maybeSingle();
 
   if (error) throw error;
-  return data?.count ?? 0;
+  return (data && data[DAILY_COUNT_COL]) ? Number(data[DAILY_COUNT_COL]) : 0;
 }
 
 
@@ -155,13 +223,13 @@ async function getMonthlyCount(userId, monthKey) {
   await probeUsageColumns();
   const { data, error } = await supabase
     .from('usage_monthly')
-    .select('count')
+    .select(MONTH_COUNT_COL)
     .eq('user_id', userId)
     .eq(MONTH_KEY_COL, monthKey)
     .maybeSingle();
 
   if (error) throw error;
-  return data?.count ?? 0;
+  return (data && data[MONTH_COUNT_COL]) ? Number(data[MONTH_COUNT_COL]) : 0;
 }
 
 
@@ -170,16 +238,17 @@ async function incDaily(userId, dateKey) {
 
   const { data: existing, error: selErr } = await supabase
     .from('usage_daily')
-    .select('count')
+    .select(DAILY_COUNT_COL)
     .eq('user_id', userId)
     .eq(DAILY_KEY_COL, dateKey)
     .maybeSingle();
 
   if (selErr) throw selErr;
 
-  const next = (existing?.count ?? 0) + 1;
+  const current = existing ? Number(existing[DAILY_COUNT_COL] ?? 0) : 0;
+  const next = current + 1;
 
-  const payload = { user_id: userId, count: next, [DAILY_KEY_COL]: dateKey };
+  const payload = { user_id: userId, [DAILY_COUNT_COL]: next, [DAILY_KEY_COL]: dateKey };
   const { error: upErr } = await supabase
     .from('usage_daily')
     .upsert(payload, { onConflict: `user_id,${DAILY_KEY_COL}` });
@@ -194,16 +263,17 @@ async function incMonthly(userId, monthKey) {
 
   const { data: existing, error: selErr } = await supabase
     .from('usage_monthly')
-    .select('count')
+    .select(MONTH_COUNT_COL)
     .eq('user_id', userId)
     .eq(MONTH_KEY_COL, monthKey)
     .maybeSingle();
 
   if (selErr) throw selErr;
 
-  const next = (existing?.count ?? 0) + 1;
+  const current = existing ? Number(existing[MONTH_COUNT_COL] ?? 0) : 0;
+  const next = current + 1;
 
-  const payload = { user_id: userId, count: next, [MONTH_KEY_COL]: monthKey };
+  const payload = { user_id: userId, [MONTH_COUNT_COL]: next, [MONTH_KEY_COL]: monthKey };
   const { error: upErr } = await supabase
     .from('usage_monthly')
     .upsert(payload, { onConflict: `user_id,${MONTH_KEY_COL}` });
@@ -382,6 +452,20 @@ function uniqueNonEmpty(arr) {
     out.push(v);
   }
   return out;
+}
+
+function isUpstreamRateLimited(err) {
+  const status = Number(err?.status || err?.statusCode || 0);
+  if (status === 429) return true;
+  const msg = String(err?.message || "");
+  return /rate limit|too many requests|quota/i.test(msg);
+}
+
+function isModelNotFound(err) {
+  const status = Number(err?.status || err?.statusCode || 0);
+  if (status === 404) return true;
+  const msg = String(err?.message || "");
+  return /model.*not found/i.test(msg) || /404\s+not found/i.test(msg);
 }
 
 async function callGeminiGenerateContent({ prompt, temperature = 0.6, maxOutputTokens = 1024 }) {
