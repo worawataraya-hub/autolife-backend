@@ -9,6 +9,21 @@ const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
+// ---- Time helpers (Thailand) ----
+function thaiDateKey(d = new Date()) {
+  const dt = new Date(d.toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }));
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const day = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+function thaiMonthKey(d = new Date()) {
+  const dt = new Date(d.toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }));
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  return `${y}-${m}`;
+}
+
 const app = express();
 
 // ---------- ENV ----------
@@ -30,9 +45,74 @@ const CHECKOUT_CANCEL_URL = process.env.CHECKOUT_CANCEL_URL;
 
 // ---------- BASIC APP SETUP ----------
 app.use(cors());
-app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
+app.use(express.json());
+
 // ---------- SUPABASE CLIENT ----------
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+// ---- Usage counters (Supabase) ----
+// Tables expected:
+// 1) usage_daily:   { user_id (uuid/text), date_key (text YYYY-MM-DD), count (int) }
+// 2) usage_monthly: { user_id (uuid/text), month_key (text YYYY-MM), count (int) }
+//
+// Create unique constraints on (user_id, date_key) and (user_id, month_key) for upsert.
+
+async function getDailyUsageCount(userId, dateKey) {
+  const { data, error } = await supabase
+    .from('usage_daily')
+    .select('count')
+    .eq('user_id', userId)
+    .eq('date_key', dateKey)
+    .maybeSingle();
+  if (error) throw error;
+  return data?.count || 0;
+}
+
+async function getMonthlyUsageCount(userId, monthKey) {
+  const { data, error } = await supabase
+    .from('usage_monthly')
+    .select('count')
+    .eq('user_id', userId)
+    .eq('month_key', monthKey)
+    .maybeSingle();
+  if (error) throw error;
+  return data?.count || 0;
+}
+
+async function incrementDailyUsage(userId, dateKey) {
+  // Upsert then increment
+  const { data: existing, error: selErr } = await supabase
+    .from('usage_daily')
+    .select('count')
+    .eq('user_id', userId)
+    .eq('date_key', dateKey)
+    .maybeSingle();
+  if (selErr) throw selErr;
+  const nextCount = (existing?.count || 0) + 1;
+
+  const { error } = await supabase
+    .from('usage_daily')
+    .upsert({ user_id: userId, date_key: dateKey, count: nextCount }, { onConflict: 'user_id,date_key' });
+  if (error) throw error;
+  return nextCount;
+}
+
+async function incrementMonthlyUsage(userId, monthKey) {
+  const { data: existing, error: selErr } = await supabase
+    .from('usage_monthly')
+    .select('count')
+    .eq('user_id', userId)
+    .eq('month_key', monthKey)
+    .maybeSingle();
+  if (selErr) throw selErr;
+  const nextCount = (existing?.count || 0) + 1;
+
+  const { error } = await supabase
+    .from('usage_monthly')
+    .upsert({ user_id: userId, month_key: monthKey, count: nextCount }, { onConflict: 'user_id,month_key' });
+  if (error) throw error;
+  return nextCount;
+}
+
 
 
 // --- Plan hydration: always read latest plan from DB (so upgrades apply immediately) ---
@@ -83,9 +163,9 @@ const geminiModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
 // ---------- PLAN & LIMIT CONFIG ----------
 const PLAN_LIMITS = {
-  free: 20,   // Free tier: 20 ครั้ง/วัน
-  basic: 20,  // เริ่มที่ 20 เหมือนกัน ปรับทีหลังง่าย
-  pro: null   // null = ไม่จำกัด
+  freeDaily: 20,
+  basicMonthly: 300,
+  proUnlimited: true,
 };
 
 const PRICE_TO_PLAN = {
@@ -129,6 +209,9 @@ function authRequired(req, res, next) {
   }
 }
 
+// Backward-compat alias (some older routes used authRequired)
+const authRequired = authRequired;
+
 async function getUsageRecord(userId, date) {
   const { data, error } = await supabase
     .from('usage_daily')
@@ -162,18 +245,22 @@ async function incrementUsage(userId, date) {
 }
 
 async function getUsageInfo(userId, plan) {
-  const limit = PLAN_LIMITS[plan] ?? null; // null = no limit
-  const date = todayISODate();
+  const todayKey = thaiDateKey();
+  const monthKey = thaiMonthKey();
 
-  const rec = await getUsageRecord(userId, date);
-  const used = rec ? rec.used : 0;
+  const usedToday = await getDailyUsageCount(userId, todayKey);
+  const usedMonth = await getMonthlyUsageCount(userId, monthKey);
 
-  return {
-    date,
-    used,
-    limit,
-    remaining: limit == null ? null : Math.max(limit - used, 0)
-  };
+  console.log({
+    user: userId,
+    plan,
+    usedToday,
+    usedMonth,
+    todayKey,
+    monthKey
+  });
+
+  return { usedToday, usedMonth, todayKey, monthKey };
 }
 
 function checkDailyLimit() {
@@ -397,89 +484,62 @@ app.post('/api/gemini-text', authRequired, hydrateUserPlan, checkDailyLimit(), a
 
 
 // ---- PADDLE CHECKOUT (ลูกค้าเริ่มจ่ายเงิน) ----
-app.post('/api/paddle/create-checkout', authMiddleware, async (req, res) => {
+app.post('/api/paddle/create-checkout', authRequired, async (req, res) => {
   try {
-    const plan = String(req.body?.plan || '').toLowerCase();
-    const email = req.user?.email;
+    const { priceId } = req.body || {};
+    if (!priceId) {
+      return res.status(400).json({ error: 'priceId_required' });
+    }
 
-    const PRICE_IDS = {
-      basic: process.env.PADDLE_BASIC_PRICE_ID,
-      pro: process.env.PADDLE_PRO_PRICE_ID,
+    if (!PADDLE_API_KEY) {
+      return res.status(500).json({ error: 'paddle_not_configured' });
+    }
+
+    const plan = PRICE_TO_PLAN[priceId];
+    if (!plan) {
+      return res.status(400).json({ error: 'unknown_price_id' });
+    }
+
+    const apiBase =
+      PADDLE_ENV === 'live'
+        ? 'https://api.paddle.com'
+        : 'https://sandbox-api.paddle.com';
+
+    const body = {
+      items: [{ price_id: priceId, quantity: 1 }],
+      customer: {
+        email: req.user.email
+      },
+      metadata: {
+        user_id: req.user.id
+      },
+      success_url: CHECKOUT_SUCCESS_URL,
+      cancel_url: CHECKOUT_CANCEL_URL
     };
 
-    if (!PRICE_IDS.basic || !PRICE_IDS.pro) {
-      return res.status(500).json({ error: 'Missing Paddle price IDs on server' });
-    }
+    const response = await axios.post(
+      `${apiBase}/checkout/sessions`,
+      body,
+      {
+        headers: {
+          Authorization: `Bearer ${PADDLE_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
 
-    if (!['basic', 'pro'].includes(plan)) {
-      return res.status(400).json({ error: 'Invalid plan. Use: basic | pro' });
-    }
+    const session = response.data;
 
-    const apiBase = (process.env.PADDLE_ENV || '').toLowerCase() === 'sandbox'
-      ? 'https://sandbox-api.paddle.com'
-      : 'https://api.paddle.com';
+    // Paddle Billing v2 จะส่ง checkout_url / id กลับมา
+    const checkoutUrl = session?.data?.checkout_url || session?.checkout_url;
 
-    const price_id = PRICE_IDS[plan];
-
-    // 1) Create a transaction for the selected recurring price
-    const createTxResp = await fetch(`${apiBase}/transactions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.PADDLE_API_KEY}`,
-      },
-      body: JSON.stringify({
-        items: [{ price_id, quantity: 1 }],
-        customer: { email },
-        custom_data: {
-          app: 'autolife',
-          plan_requested: plan,
-          app_user_email: email,
-        },
-      }),
+    res.json({
+      sessionId: session?.data?.id || session?.id,
+      checkoutUrl
     });
-
-    const createTxJson = await createTxResp.json().catch(() => ({}));
-    if (!createTxResp.ok) {
-      console.error('Paddle create transaction failed', createTxResp.status, createTxJson);
-      return res.status(502).json({ error: 'Paddle create transaction failed', details: createTxJson });
-    }
-
-    const transactionId = createTxJson?.data?.id;
-    if (!transactionId) {
-      console.error('Paddle create transaction: missing id', createTxJson);
-      return res.status(502).json({ error: 'Paddle transaction id missing' });
-    }
-
-    // 2) Pass the transaction to checkout to get a hosted checkout URL
-    const checkoutResp = await fetch(`${apiBase}/transactions/${transactionId}/checkout`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.PADDLE_API_KEY}`,
-      },
-      body: JSON.stringify({
-        success_url: process.env.CHECKOUT_SUCCESS_URL,
-        cancel_url: process.env.CHECKOUT_CANCEL_URL,
-      }),
-    });
-
-    const checkoutJson = await checkoutResp.json().catch(() => ({}));
-    if (!checkoutResp.ok) {
-      console.error('Paddle checkout failed', checkoutResp.status, checkoutJson);
-      return res.status(502).json({ error: 'Paddle checkout failed', details: checkoutJson });
-    }
-
-    const checkoutUrl = checkoutJson?.data?.url || checkoutJson?.data?.checkout?.url;
-    if (!checkoutUrl) {
-      console.error('Paddle checkout: missing url', checkoutJson);
-      return res.status(502).json({ error: 'Paddle checkout url missing' });
-    }
-
-    return res.json({ checkout_url: checkoutUrl });
   } catch (err) {
-    console.error('create-checkout error:', err);
-    return res.status(500).json({ error: 'Server error' });
+    console.error('create-checkout error', err.response?.data || err);
+    res.status(500).json({ error: 'paddle_error' });
   }
 });
 
@@ -488,92 +548,60 @@ app.post('/api/paddle/create-checkout', authMiddleware, async (req, res) => {
 // แนะนำเปิด log แล้วดู payload จริงจาก Paddle แล้วปรับ field ให้ตรง
 app.post('/api/paddle/webhook', async (req, res) => {
   try {
-    const secret = process.env.PADDLE_WEBHOOK_SECRET;
-    if (!secret) return res.status(500).send('Missing PADDLE_WEBHOOK_SECRET');
+    const event = req.body;
+    const type = event.event_type || event.type;
 
-    const sig = req.get('paddle-signature') || '';
-    // Format: ts=...,h1=...
-    const parts = Object.fromEntries(sig.split(',').map(p => p.trim().split('=')));
-    const ts = parts.ts;
-    const h1 = parts.h1;
-    if (!ts || !h1) return res.status(400).send('Invalid paddle-signature header');
+    console.log('Paddle webhook:', type);
 
-    const raw = req.rawBody ? req.rawBody.toString('utf8') : JSON.stringify(req.body || {});
-    const crypto = require('crypto');
-    const expected = crypto.createHmac('sha256', secret).update(`${ts}:${raw}`).digest('hex');
+    // ตัวอย่างสำหรับ Billing v2: subscription.activated / subscription.updated
+    if (
+      type === 'subscription.activated' ||
+      type === 'subscription.updated'
+    ) {
+      const data = event.data || event;
+      const priceId =
+        data.items?.[0]?.price?.id ||
+        data.items?.[0]?.price_id ||
+        data.price_id;
 
-    // constant-time compare
-    const safeEqual = (a, b) => {
-      const ba = Buffer.from(String(a));
-      const bb = Buffer.from(String(b));
-      if (ba.length !== bb.length) return false;
-      return crypto.timingSafeEqual(ba, bb);
-    };
+      const plan = PRICE_TO_PLAN[priceId];
 
-    if (!safeEqual(expected, h1)) {
-      console.warn('Paddle webhook signature mismatch');
-      return res.status(401).send('Invalid signature');
+      const email =
+        data.customer?.email || data.customer_email || data.user_email;
+
+      if (plan && email) {
+        const { data: user, error } = await supabase
+          .from('users')
+          .upsert(
+            {
+              email: email.toLowerCase(),
+              plan,
+              paddle_customer_id: customerId || null,
+              paddle_subscription_id: subscriptionId || null,
+            },
+            { onConflict: 'email' }
+          )
+          .select()
+          .maybeSingle();
+
+        if (error) {
+          console.error('supabase update error from webhook', error);
+        } else {
+          console.log('Updated user from webhook:', user.email, 'plan:', user.plan);
+        }
+      } else {
+        console.warn('Webhook plan/email not resolved', { priceId, plan, email });
+      }
     }
 
-    const event = JSON.parse(raw);
-    const eventType = event?.event_type;
-
-    // Map price_id -> plan
-    const basicId = process.env.PADDLE_BASIC_PRICE_ID;
-    const proId = process.env.PADDLE_PRO_PRICE_ID;
-
-    const inferPlanFromPriceId = (pid) => {
-      if (!pid) return null;
-      if (pid === proId) return 'pro';
-      if (pid === basicId) return 'basic';
-      return null;
-    };
-
-    // Extract customer email as robustly as possible
-    const customerEmail =
-      event?.data?.customer?.email ||
-      event?.data?.customer_email ||
-      event?.data?.billing_details?.email ||
-      event?.data?.custom_data?.app_user_email;
-
-    // Subscription items may vary by event type
-    const priceId =
-      event?.data?.items?.[0]?.price?.id ||
-      event?.data?.items?.[0]?.price_id ||
-      event?.data?.line_items?.[0]?.price?.id ||
-      event?.data?.line_items?.[0]?.price_id;
-
-    const planFromPrice = inferPlanFromPriceId(priceId);
-
-    console.log('[PADDLE WEBHOOK]', { eventType, customerEmail, priceId, planFromPrice });
-
-    // Update user plan in DB when subscription is active/updated/paused/canceled etc.
-    if (customerEmail && planFromPrice && ['subscription.created','subscription.updated','subscription.activated','subscription.resumed'].includes(eventType)) {
-      await supabase
-        .from('users')
-        .update({ plan: planFromPrice })
-        .eq('email', customerEmail);
-
-      await supabase
-        .from('public.users')
-        .update({ plan: planFromPrice })
-        .eq('email', customerEmail);
-    }
-
-    if (customerEmail && ['subscription.canceled','subscription.paused'].includes(eventType)) {
-      // Downgrade to free on cancel/pause
-      await supabase.from('users').update({ plan: 'free' }).eq('email', customerEmail);
-      await supabase.from('public.users').update({ plan: 'free' }).eq('email', customerEmail);
-    }
-
-    return res.status(200).json({ received: true });
+    res.status(200).send('ok');
   } catch (err) {
-    console.error('Webhook error:', err);
-    return res.status(500).send('Webhook error');
+    console.error('webhook error', err);
+    res.status(500).send('error');
   }
 });
 
 // ---------- START ----------
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ AutoLife backend listening on http://localhost:${PORT}`);
 });
