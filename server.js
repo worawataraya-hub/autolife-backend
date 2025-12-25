@@ -116,7 +116,9 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 let DAILY_KEY_COL = process.env.DAILY_KEY_COL || 'date';
 let MONTH_KEY_COL = process.env.MONTH_KEY_COL || 'month';
 let DAILY_COUNT_COL = process.env.DAILY_COUNT_COL || 'used';
-let MONTH_COUNT_COL = process.env.MONTH_COUNT_COL || 'used';
+// NOTE: your Supabase screenshot shows public.usage_monthly uses column `count`
+// (while public.usage_daily uses column `used`).
+let MONTH_COUNT_COL = process.env.MONTH_COUNT_COL || 'count';
 let _usageColsProbed = false;
 
 const COUNT_CANDIDATES = ['count', 'used', 'used_count', 'usage', 'usage_count', 'calls', 'call_count'];
@@ -140,8 +142,8 @@ async function probeUsageColumns() {
       console.warn('[probe] usage_daily missing date_key; falling back to column: date');
     }
 
-    // If count column missing, try candidates
-    if (error && (error.code === '42703' || error.code === 'PGRST204') && String(error.message || '').toLowerCase().includes("'count'")) {
+    // If selected count column is missing, try candidates (ex: `used` vs `count`).
+    if (error && (error.code === '42703' || error.code === 'PGRST204')) {
       for (const cand of COUNT_CANDIDATES) {
         try {
           const { error: e2 } = await supabase
@@ -152,7 +154,7 @@ async function probeUsageColumns() {
             .limit(1);
           if (!e2) {
             DAILY_COUNT_COL = cand;
-            console.warn(`[probe] usage_daily missing count; falling back to column: ${cand}`);
+            console.warn(`[probe] usage_daily count column not found; falling back to column: ${cand}`);
             break;
           }
         } catch {}
@@ -177,7 +179,8 @@ async function probeUsageColumns() {
       console.warn('[probe] usage_monthly missing month_key; falling back to column: month');
     }
 
-    if (error && (error.code === '42703' || error.code === 'PGRST204') && String(error.message || '').toLowerCase().includes("'count'")) {
+    // If the selected count column is wrong/missing, try candidates
+    if (error && (error.code === '42703' || error.code === 'PGRST204')) {
       for (const cand of COUNT_CANDIDATES) {
         try {
           const { error: e2 } = await supabase
