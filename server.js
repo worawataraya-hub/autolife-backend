@@ -113,10 +113,10 @@ app.use((req, res, next) => {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // --- Usage table column compatibility (older DB might use 'date'/'month' instead of 'date_key'/'month_key') ---
-let DAILY_KEY_COL = process.env.DAILY_KEY_COL || 'date_key';
-let MONTH_KEY_COL = process.env.MONTH_KEY_COL || 'month_key';
-let DAILY_COUNT_COL = process.env.DAILY_COUNT_COL || 'count';
-let MONTH_COUNT_COL = process.env.MONTH_COUNT_COL || 'count';
+let DAILY_KEY_COL = process.env.DAILY_KEY_COL || 'date';
+let MONTH_KEY_COL = process.env.MONTH_KEY_COL || 'month';
+let DAILY_COUNT_COL = process.env.DAILY_COUNT_COL || 'used';
+let MONTH_COUNT_COL = process.env.MONTH_COUNT_COL || 'used';
 let _usageColsProbed = false;
 
 const COUNT_CANDIDATES = ['count', 'used', 'used_count', 'usage', 'usage_count', 'calls', 'call_count'];
@@ -135,13 +135,13 @@ async function probeUsageColumns() {
       .eq(DAILY_KEY_COL, probeVal)
       .limit(1);
 
-    if (error && error.code === '42703' && String(error.message || '').includes('date_key')) {
+    if (error && (error.code === '42703' || error.code === 'PGRST204') && String(error.message || '').includes('date_key')) {
       DAILY_KEY_COL = 'date';
       console.warn('[probe] usage_daily missing date_key; falling back to column: date');
     }
 
     // If count column missing, try candidates
-    if (error && error.code === '42703' && String(error.message || '').toLowerCase().includes("'count'")) {
+    if (error && (error.code === '42703' || error.code === 'PGRST204') && String(error.message || '').toLowerCase().includes("'count'")) {
       for (const cand of COUNT_CANDIDATES) {
         try {
           const { error: e2 } = await supabase
@@ -172,12 +172,12 @@ async function probeUsageColumns() {
       .eq(MONTH_KEY_COL, probeVal)
       .limit(1);
 
-    if (error && error.code === '42703' && String(error.message || '').includes('month_key')) {
+    if (error && (error.code === '42703' || error.code === 'PGRST204') && String(error.message || '').includes('month_key')) {
       MONTH_KEY_COL = 'month';
       console.warn('[probe] usage_monthly missing month_key; falling back to column: month');
     }
 
-    if (error && error.code === '42703' && String(error.message || '').toLowerCase().includes("'count'")) {
+    if (error && (error.code === '42703' || error.code === 'PGRST204') && String(error.message || '').toLowerCase().includes("'count'")) {
       for (const cand of COUNT_CANDIDATES) {
         try {
           const { error: e2 } = await supabase
