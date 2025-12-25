@@ -29,7 +29,7 @@ const app = express();
 // ---------- ENV ----------
 const PORT = process.env.PORT || 10000;
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -348,121 +348,128 @@ async function bumpUsage(userId) {
 }
 
 // ---------- GEMINI ----------
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const geminiModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-function isUpstreamRateLimited(err) {
-  const status = err?.response?.status;
-  if (status === 429 || status === 503) return true;
-  const msg = String(err?.message || "").toLowerCase();
-  return msg.includes("429") || msg.includes("rate") || msg.includes("quota") || msg.includes("resource has been exhausted");
+// =============================
+// Gemini (Text) - REST client (supports v1 + v1beta) with model fallback
+// =============================
+function normalizeGeminiModelName(name) {
+  if (!name) return "";
+  let s = String(name).trim();
+  if (s.startsWith("models/")) s = s.slice("models/".length);
+  if (s.includes("/")) s = s.split("/").pop();
+  return s;
 }
 
-// ---------- ROUTES ----------
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true, service: "AutoLife backend", env: PADDLE_ENV });
-});
-
-// --- AUTH ---
-app.post("/api/auth/register", async (req, res) => {
-  try {
-    const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: "email_and_password_required" });
-
-    const normalizedEmail = String(email).trim().toLowerCase();
-
-    const { data: existing, error: exErr } = await supabase
-      .from("users")
-      .select("id")
-      .eq("email", normalizedEmail)
-      .maybeSingle();
-    if (exErr) throw exErr;
-    if (existing) return res.status(409).json({ error: "email_already_registered" });
-
-    const password_hash = await bcrypt.hash(password, 10);
-    const { data: newUser, error: insErr } = await supabase
-      .from("users")
-      .insert({ email: normalizedEmail, password_hash, plan: "free" })
-      .select()
-      .single();
-    if (insErr) throw insErr;
-
-    const token = signToken(newUser);
-    return res.json({ token, user: { id: newUser.id, email: newUser.email, plan: newUser.plan } });
-  } catch (err) {
-    console.error("register error", err);
-    return res.status(500).json({ error: "internal_error", message: "ระบบขัดข้อง" });
+function uniqueNonEmpty(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const x of arr) {
+    const v = (x || "").trim();
+    if (!v) continue;
+    if (seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
   }
-});
+  return out;
+}
 
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: "email_and_password_required" });
-
-    const normalizedEmail = String(email).trim().toLowerCase();
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("*")
-      .eq("email", normalizedEmail)
-      .single();
-
-    if (error || !user) return res.status(401).json({ error: "invalid_credentials", message: "อีเมล/รหัสผ่านไม่ถูกต้อง" });
-
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: "invalid_credentials", message: "อีเมล/รหัสผ่านไม่ถูกต้อง" });
-
-    const token = signToken(user);
-    return res.json({ token, user: { id: user.id, email: user.email, plan: user.plan } });
-  } catch (err) {
-    console.error("login error", err);
-    return res.status(500).json({ error: "internal_error", message: "ระบบขัดข้อง" });
+async function callGeminiGenerateContent({ prompt, temperature = 0.6, maxOutputTokens = 1024 }) {
+  if (!GEMINI_API_KEY) {
+    const err = new Error("Missing GEMINI_API_KEY");
+    err.status = 500;
+    throw err;
   }
-});
 
-app.get("/api/me", authRequired, hydrateUserPlan, async (req, res) => {
-  try {
-    const { id } = req.user;
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("id,email,plan,created_at,paddle_customer_id,paddle_subscription_id")
-      .eq("id", id)
-      .single();
-    if (error || !user) return res.status(404).json({ error: "user_not_found" });
+  const envModel = normalizeGeminiModelName(process.env.GEMINI_MODEL || "");
+  const modelCandidates = uniqueNonEmpty([
+    envModel,
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-latest",
+  ]);
 
-    const usage = await (async () => {
-      const dateKey = thaiDateKey();
-      const monthKey = thaiMonthKey();
-      const usedToday = await getDailyCount(user.id, dateKey);
-      const usedMonth = await getMonthlyCount(user.id, monthKey);
-      return { usedToday, usedMonth, dateKey, monthKey };
-    })();
+  const apiVersions = ["v1", "v1beta"];
 
-    return res.json({ user, usage });
-  } catch (err) {
-    console.error("/api/me error", err);
-    return res.status(500).json({ error: "internal_error", message: "ระบบขัดข้อง" });
+  let lastError = null;
+
+  for (const apiVersion of apiVersions) {
+    for (const model of modelCandidates) {
+      const url =
+        `https://generativelanguage.googleapis.com/${apiVersion}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+
+      try {
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            generationConfig: { temperature, maxOutputTokens },
+          }),
+        });
+
+        if (resp.status === 429) {
+          const err = new Error("Gemini rate limited (429)");
+          err.status = 429;
+          err.body = await resp.text().catch(() => "");
+          throw err;
+        }
+
+        if (!resp.ok) {
+          const body = await resp.text().catch(() => "");
+          const err = new Error(`Gemini HTTP ${resp.status} (${apiVersion}/${model})`);
+          err.status = resp.status;
+          err.body = body;
+          lastError = err;
+          continue;
+        }
+
+        const data = await resp.json();
+
+        const textOut =
+          data?.candidates?.[0]?.content?.parts?.map((p) => p?.text).filter(Boolean).join("\n") ||
+          data?.candidates?.[0]?.content?.parts?.[0]?.text ||
+          "";
+
+        if (!textOut) {
+          const err = new Error(`Gemini empty response (${apiVersion}/${model})`);
+          err.status = 502;
+          err.body = JSON.stringify(data).slice(0, 2000);
+          lastError = err;
+          continue;
+        }
+
+        return { text: textOut, modelUsed: model, apiVersion };
+      } catch (e) {
+        lastError = e;
+        if (e?.status === 429) throw e;
+      }
+    }
   }
-});
 
-// --- GEMINI TEXT ---
+  const err = lastError || new Error("Gemini request failed");
+  err.status = err.status || 502;
+  throw err;
+}
+
 app.post("/api/gemini-text", authRequired, hydrateUserPlan, quotaGuard(), async (req, res) => {
   try {
     const { prompt } = req.body || {};
     if (!prompt) return res.status(400).json({ error: "prompt_required" });
 
-    const result = await geminiModel.generateContent(String(prompt));
-    const response = await result.response;
-    const text = response.text();
+    const { text: aiText, modelUsed, apiVersion } = await callGeminiGenerateContent({
+      prompt: String(prompt),
+      temperature: 0.6,
+      maxOutputTokens: 1024,
+    });
 
     const usage = await bumpUsage(req.user.id);
-    return res.json({ text, usage });
+    return res.json({ text: aiText, modelUsed, apiVersion, usage });
   } catch (err) {
-    console.error("gemini-text error", err?.response?.data || err);
-    if (isUpstreamRateLimited(err)) {
-      return res.status(429).json({ error: "busy", message: "ระบบกำลังหนาแน่น (429) กรุณาลองใหม่อีกครั้ง" });
+    console.error("gemini-text error", err?.body || err);
+    if (err?.status === 429 || isUpstreamRateLimited(err)) {
+      return res.status(429).json({ error: "rate_limited", message: "ระบบกำลังหนาแน่น กรุณาลองใหม่อีกครั้ง" });
     }
-    return res.status(500).json({ error: "internal_error", message: "ระบบขัดข้อง" });
+    return res.status(500).json({ error: "gemini_error", message: "ระบบขัดข้อง กรุณาลองใหม่อีกครั้ง" });
   }
 });
 
