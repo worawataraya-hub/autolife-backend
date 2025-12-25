@@ -68,72 +68,138 @@ app.use(express.json({ limit: "2mb" })); // for normal JSON routes
 // ---------- SUPABASE ----------
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+// --- Usage table column compatibility (older DB might use 'date'/'month' instead of 'date_key'/'month_key') ---
+let DAILY_KEY_COL = process.env.DAILY_KEY_COL || 'date_key';
+let MONTH_KEY_COL = process.env.MONTH_KEY_COL || 'month_key';
+let _usageColsProbed = false;
+
+async function probeUsageColumns() {
+  if (_usageColsProbed) return;
+  _usageColsProbed = true;
+
+  // Probe daily
+  try {
+    const probeVal = '1900-01-01';
+    const { error } = await supabase
+      .from('usage_daily')
+      .select('count')
+      .eq('user_id', 'probe')
+      .eq(DAILY_KEY_COL, probeVal)
+      .limit(1);
+
+    if (error && error.code === '42703' && String(error.message || '').includes('date_key')) {
+      DAILY_KEY_COL = 'date';
+      console.warn('[probe] usage_daily missing date_key; falling back to column: date');
+    } else if (error && error.code === '42703') {
+      // generic missing column
+      console.warn('[probe] usage_daily column probe error:', error);
+    }
+  } catch (e) {
+    console.warn('[probe] usage_daily probe exception:', e?.message || e);
+  }
+
+  // Probe monthly
+  try {
+    const probeVal = '1900-01';
+    const { error } = await supabase
+      .from('usage_monthly')
+      .select('count')
+      .eq('user_id', 'probe')
+      .eq(MONTH_KEY_COL, probeVal)
+      .limit(1);
+
+    if (error && error.code === '42703' && String(error.message || '').includes('month_key')) {
+      MONTH_KEY_COL = 'month';
+      console.warn('[probe] usage_monthly missing month_key; falling back to column: month');
+    } else if (error && error.code === '42703') {
+      console.warn('[probe] usage_monthly column probe error:', error);
+    }
+  } catch (e) {
+    console.warn('[probe] usage_monthly probe exception:', e?.message || e);
+  }
+}
+
+
 // Expected tables (recommended):
 // users: { id uuid pk, email text unique, password_hash text, plan text, paddle_customer_id text, paddle_subscription_id text, created_at }
 // usage_daily:   { user_id uuid/text, date_key text 'YYYY-MM-DD', count int, updated_at } unique(user_id,date_key)
 // usage_monthly: { user_id uuid/text, month_key text 'YYYY-MM',  count int, updated_at } unique(user_id,month_key)
 
 async function getDailyCount(userId, dateKey) {
+  await probeUsageColumns();
   const { data, error } = await supabase
-    .from("usage_daily")
-    .select("count")
-    .eq("user_id", userId)
-    .eq("date_key", dateKey)
+    .from('usage_daily')
+    .select('count')
+    .eq('user_id', userId)
+    .eq(DAILY_KEY_COL, dateKey)
     .maybeSingle();
+
   if (error) throw error;
-  return data?.count || 0;
+  return data?.count ?? 0;
 }
+
 
 async function getMonthlyCount(userId, monthKey) {
+  await probeUsageColumns();
   const { data, error } = await supabase
-    .from("usage_monthly")
-    .select("count")
-    .eq("user_id", userId)
-    .eq("month_key", monthKey)
+    .from('usage_monthly')
+    .select('count')
+    .eq('user_id', userId)
+    .eq(MONTH_KEY_COL, monthKey)
     .maybeSingle();
+
   if (error) throw error;
-  return data?.count || 0;
+  return data?.count ?? 0;
 }
+
 
 async function incDaily(userId, dateKey) {
+  await probeUsageColumns();
+
   const { data: existing, error: selErr } = await supabase
-    .from("usage_daily")
-    .select("count")
-    .eq("user_id", userId)
-    .eq("date_key", dateKey)
+    .from('usage_daily')
+    .select('count')
+    .eq('user_id', userId)
+    .eq(DAILY_KEY_COL, dateKey)
     .maybeSingle();
+
   if (selErr) throw selErr;
 
-  const nextCount = (existing?.count || 0) + 1;
-  const { error } = await supabase
-    .from("usage_daily")
-    .upsert(
-      { user_id: userId, date_key: dateKey, count: nextCount },
-      { onConflict: "user_id,date_key" }
-    );
-  if (error) throw error;
-  return nextCount;
+  const next = (existing?.count ?? 0) + 1;
+
+  const payload = { user_id: userId, count: next, [DAILY_KEY_COL]: dateKey };
+  const { error: upErr } = await supabase
+    .from('usage_daily')
+    .upsert(payload, { onConflict: `user_id,${DAILY_KEY_COL}` });
+
+  if (upErr) throw upErr;
+  return next;
 }
+
 
 async function incMonthly(userId, monthKey) {
+  await probeUsageColumns();
+
   const { data: existing, error: selErr } = await supabase
-    .from("usage_monthly")
-    .select("count")
-    .eq("user_id", userId)
-    .eq("month_key", monthKey)
+    .from('usage_monthly')
+    .select('count')
+    .eq('user_id', userId)
+    .eq(MONTH_KEY_COL, monthKey)
     .maybeSingle();
+
   if (selErr) throw selErr;
 
-  const nextCount = (existing?.count || 0) + 1;
-  const { error } = await supabase
-    .from("usage_monthly")
-    .upsert(
-      { user_id: userId, month_key: monthKey, count: nextCount },
-      { onConflict: "user_id,month_key" }
-    );
-  if (error) throw error;
-  return nextCount;
+  const next = (existing?.count ?? 0) + 1;
+
+  const payload = { user_id: userId, count: next, [MONTH_KEY_COL]: monthKey };
+  const { error: upErr } = await supabase
+    .from('usage_monthly')
+    .upsert(payload, { onConflict: `user_id,${MONTH_KEY_COL}` });
+
+  if (upErr) throw upErr;
+  return next;
 }
+
 
 // ---------- TIME HELPERS (Thailand) ----------
 function toBangkokDate(d = new Date()) {
