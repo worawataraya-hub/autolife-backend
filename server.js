@@ -72,8 +72,8 @@ const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || "")
 // sensible defaults (your known frontends)
 if (!ALLOWED_ORIGINS.length) {
   ALLOWED_ORIGINS.push(
+    // Netlify production site (Origin never has a trailing slash, but keep it clean anyway)
     "https://autolife-ai.netlify.app",
-    "https://autolife-ai.netlify.app/",
     "http://localhost:5173",
     "http://localhost:3000",
     "http://localhost:5500",
@@ -84,8 +84,17 @@ const corsOptions = {
   origin(origin, cb) {
     // allow server-to-server / curl (no Origin)
     if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error(`CORS blocked for origin: ${origin}`));
+
+    // normalize (Origin does not include a trailing slash, but sometimes configs do)
+    const o = String(origin).replace(/\/$/, "");
+    const allowList = new Set(ALLOWED_ORIGINS.map((x) => String(x).replace(/\/$/, "")));
+    if (allowList.has(o)) return cb(null, true);
+
+    // Allow Netlify Deploy Previews for this site, e.g.
+    // https://<hash>--autolife-ai.netlify.app
+    if (/^https:\/\/[a-z0-9-]+--autolife-ai\.netlify\.app$/i.test(o)) return cb(null, true);
+
+    return cb(new Error(`CORS blocked for origin: ${o}`));
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
