@@ -587,6 +587,86 @@ app.post("/api/gemini-text", authRequired, hydrateUserPlan, quotaGuard(), async 
   }
 });
 
+// ------------------------
+// Extra API routes for static HTML build (replacing Netlify Functions)
+// ------------------------
+app.post("/api/geminiHook", async (req, res) => {
+  try {
+    const { transcript = "", language = "th" } = req.body || {};
+    const safeTranscript = String(transcript || "").slice(0, 8000);
+
+    // If no transcript, return a safe default
+    if (!safeTranscript.trim()) {
+      return res.json({ hookStart: 0, hookDuration: 3, rationale: "No transcript provided" });
+    }
+
+    const prompt = [
+      "You are a video editor assistant.",
+      "Given a short transcript, estimate the best hook segment for a short-form video.",
+      "Return ONLY valid JSON with keys: hookStart (number, seconds), hookDuration (number, seconds), rationale (string).",
+      "Rules:",
+      "- hookStart must be >= 0",
+      "- hookDuration between 2 and 6",
+      "- Keep rationale short.",
+      "",
+      `Language hint: ${language}`,
+      "",
+      "Transcript:",
+      safeTranscript
+    ].join("\n");
+
+    // Ask Gemini for strict JSON
+    const out = await callGeminiGenerateContent({
+      prompt,
+      temperature: 0.3,
+      maxOutputTokens: 256,
+      responseMimeType: "application/json",
+    });
+
+    let jsonText = (out && out.text) ? String(out.text) : "";
+    // Gemini sometimes wraps JSON in code fences
+    jsonText = jsonText.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonText);
+    } catch (e) {
+      // fallback - try to extract first JSON object
+      const match = jsonText.match(/\{[\s\S]*\}/);
+      parsed = match ? JSON.parse(match[0]) : null;
+    }
+
+    if (!parsed || typeof parsed !== "object") {
+      return res.json({ hookStart: 0, hookDuration: 3, rationale: "Fallback (invalid model output)" });
+    }
+
+    const hookStart = Number(parsed.hookStart);
+    const hookDuration = Number(parsed.hookDuration);
+
+    return res.json({
+      hookStart: Number.isFinite(hookStart) ? Math.max(0, hookStart) : 0,
+      hookDuration: Number.isFinite(hookDuration) ? Math.min(6, Math.max(2, hookDuration)) : 3,
+      rationale: String(parsed.rationale || "")
+    });
+  } catch (err) {
+    console.error("geminiHook error:", err);
+    return res.status(err.status || 500).json({ error: err.message || "geminiHook failed" });
+  }
+});
+
+app.post("/api/logUsage", async (req, res) => {
+  try {
+    // Keep compatible with the old Netlify function signature
+    const { user, action, meta } = req.body || {};
+    console.log("[logUsage]", { user, action, meta });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("logUsage error:", err);
+    return res.status(500).json({ ok: false });
+  }
+});
+
+
 
 
 // ---------- AUTH ROUTES (email+password -> JWT) ----------
