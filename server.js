@@ -85,14 +85,16 @@ const corsOptions = {
     // allow server-to-server / curl (no Origin)
     if (!origin) return cb(null, true);
 
-    // normalize (Origin does not include a trailing slash, but sometimes configs do)
     const o = String(origin).replace(/\/$/, "");
     const allowList = new Set(ALLOWED_ORIGINS.map((x) => String(x).replace(/\/$/, "")));
     if (allowList.has(o)) return cb(null, true);
 
-    // Allow Netlify Deploy Previews for this site, e.g.
-    // https://<hash>--autolife-ai.netlify.app
-    if (/^https:\/\/[a-z0-9-]+--autolife-ai\.netlify\.app$/i.test(o)) return cb(null, true);
+    // Allow any Netlify site / deploy preview under netlify.app
+    // (Netlify preview origins look like: https://<hash>--<site>.netlify.app)
+    if (/^https:\/\/[a-z0-9-]+(?:--[a-z0-9-]+)?\.netlify\.app$/i.test(o)) return cb(null, true);
+
+    // Local dev convenience
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(o)) return cb(null, true);
 
     return cb(new Error(`CORS blocked for origin: ${o}`));
   },
