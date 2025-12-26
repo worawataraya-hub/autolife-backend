@@ -482,7 +482,7 @@ function isModelNotFound(err) {
   return /model.*not found/i.test(msg) || /404\s+not found/i.test(msg);
 }
 
-async function callGeminiGenerateContent({ prompt, temperature = 0.6, maxOutputTokens = 1024 }) {
+async function callGeminiGenerateContent({ prompt, temperature = 0.6, maxOutputTokens = 1024, responseMimeType }) {
   if (!GEMINI_API_KEY) {
     const err = new Error("Missing GEMINI_API_KEY");
     err.status = 500;
@@ -513,7 +513,7 @@ async function callGeminiGenerateContent({ prompt, temperature = 0.6, maxOutputT
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             contents: [{ role: "user", parts: [{ text: prompt }] }],
-            generationConfig: { temperature, maxOutputTokens },
+            generationConfig: Object.assign({ temperature, maxOutputTokens }, responseMimeType ? { responseMimeType } : {}),
           }),
         });
 
@@ -563,7 +563,7 @@ async function callGeminiGenerateContent({ prompt, temperature = 0.6, maxOutputT
 
 app.post("/api/gemini-text", authRequired, hydrateUserPlan, quotaGuard(), async (req, res) => {
   try {
-    const { prompt } = req.body || {};
+    const { prompt, responseMimeType } = req.body || {};
     if (!prompt) return res.status(400).json({ error: "prompt_required" });
 
     const { text: aiText, modelUsed, apiVersion } = await callGeminiGenerateContent({
