@@ -105,6 +105,8 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+app.get('/api/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
 app.options("*", cors(corsOptions));
 const jsonParser = express.json({
   limit: "2mb",
