@@ -565,13 +565,15 @@ async function callGeminiGenerateContent({ prompt, temperature = 0.6, maxOutputT
 
 app.post("/api/gemini-text", authRequired, hydrateUserPlan, quotaGuard(), async (req, res) => {
   try {
-    const { prompt, responseMimeType } = req.body || {};
+    const { prompt, responseMimeType, useSearch } = req.body || {};
     if (!prompt) return res.status(400).json({ error: "prompt_required" });
 
     const { text: aiText, modelUsed, apiVersion } = await callGeminiGenerateContent({
       prompt: String(prompt),
+      useSearch: !!useSearch,
+      responseMimeType: responseMimeType ? String(responseMimeType) : undefined,
       temperature: 0.6,
-      maxOutputTokens: 1024,
+      maxOutputTokens: 2048,
     });
 
     const usage = await bumpUsage(req.user.id);
