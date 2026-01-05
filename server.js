@@ -25,6 +25,71 @@ const { createClient } = require("@supabase/supabase-js");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const app = express();
+// ---------- OBSERVABILITY / UTILITIES (v42) ----------
+function makeRequestId() {
+  try {
+    return (crypto && typeof crypto.randomUUID === "function")
+      ? crypto.randomUUID()
+      : (Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10));
+  } catch (_) {
+    return (Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10));
+  }
+}
+function truncateLog(str, max = 700) {
+  if (str === undefined || str === null) return "";
+  const s = String(str);
+  return s.length > max ? (s.slice(0, max) + "…(truncated)") : s;
+}
+
+// Simple in-memory cache (good enough for Render single instance; swap to Redis later)
+const _memCache = new Map(); // key -> { exp:number, value:any }
+function cacheGet(key) {
+  const v = _memCache.get(key);
+  if (!v) return null;
+  if (v.exp && Date.now() > v.exp) {
+    _memCache.delete(key);
+    return null;
+  }
+  return v.value;
+}
+function cacheSet(key, value, ttlMs) {
+  _memCache.set(key, { exp: ttlMs ? (Date.now() + ttlMs) : 0, value });
+}
+
+// Simple per-IP rate limiter (no deps)
+const _rateState = new Map(); // ip -> { reset:number, count:number }
+function rateLimit({ windowMs, max }) {
+  return (req, res, next) => {
+    const ipRaw = req.headers["x-forwarded-for"];
+    const ip = (typeof ipRaw === "string" && ipRaw.length)
+      ? ipRaw.split(",")[0].trim()
+      : (req.ip || "unknown");
+    const now = Date.now();
+    let s = _rateState.get(ip);
+    if (!s || now > s.reset) {
+      s = { reset: now + windowMs, count: 0 };
+      _rateState.set(ip, s);
+    }
+    s.count += 1;
+
+    res.setHeader("X-RateLimit-Limit", String(max));
+    res.setHeader("X-RateLimit-Remaining", String(Math.max(0, max - s.count)));
+    res.setHeader("X-RateLimit-Reset", String(Math.ceil(s.reset / 1000)));
+
+    if (s.count > max) {
+      res.setHeader("Retry-After", String(Math.ceil((s.reset - now) / 1000)));
+      return res.status(429).json({
+        ok: false,
+        error: "Rate limit exceeded",
+        requestId: req.requestId || null
+      });
+    }
+    return next();
+  };
+}
+const aiLimiter = rateLimit({ windowMs: 5 * 60 * 1000, max: 30 });
+// ---------- /OBSERVABILITY / UTILITIES ----------
+
 
 // ---------- ENV ----------
 const PORT = process.env.PORT || 10000;
@@ -122,7 +187,40 @@ app.use((req, res, next) => {
   return jsonParser(req, res, next);
 });
 
+// Trust proxy (Render/Netlify) so req.ip works correctly
+app.set("trust proxy", 1);
+
+// RequestId + latency log (one line start/end)
+app.use((req, res, next) => {
+  const requestId = req.headers["x-request-id"] || makeRequestId();
+  req.requestId = requestId;
+  const t0 = Date.now();
+  res.setHeader("X-Request-Id", requestId);
+
+  console.log(JSON.stringify({
+    t: "start",
+    id: requestId,
+    method: req.method,
+    path: req.originalUrl,
+    ip: req.headers["x-forwarded-for"] || req.ip || null
+  }));
+
+  res.on("finish", () => {
+    console.log(JSON.stringify({
+      t: "end",
+      id: requestId,
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      ms: Date.now() - t0
+    }));
+  });
+
+  next();
+});
+
 // ---------- SUPABASE ----------
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // --- Usage table column compatibility (older DB might use 'date'/'month' instead of 'date_key'/'month_key') ---
@@ -364,7 +462,61 @@ async function hydrateUserPlan(req, res, next) {
 const LIMITS = {
   freeDaily: 20,
   basicMonthly: 300,
-};
+}
+
+function nextThaiMidnightIso() {
+  const dt = toBangkokDate(new Date());
+  dt.setHours(24, 0, 0, 0); // next midnight in Bangkok "wall clock"
+  return dt.toISOString();
+}
+function nextThaiMonthIso() {
+  const dt = toBangkokDate(new Date());
+  dt.setDate(1);
+  dt.setHours(0, 0, 0, 0);
+  dt.setMonth(dt.getMonth() + 1); // first day next month 00:00 Bangkok
+  return dt.toISOString();
+}
+function usageSummary(plan, usage) {
+  const p = String(plan || "free").toLowerCase();
+  const u = usage || {};
+  const usedToday = Number(u.usedToday || 0);
+  const usedMonth = Number(u.usedMonth || 0);
+
+  if (p === "pro") {
+    return {
+      plan: "pro",
+      window: "unlimited",
+      limit: null,
+      used: null,
+      remaining: null,
+      resetAt: null
+    };
+  }
+  if (p === "basic") {
+    const limit = LIMITS.basicMonthly;
+    const remaining = Math.max(0, limit - usedMonth);
+    return {
+      plan: "basic",
+      window: "monthly",
+      limit,
+      used: usedMonth,
+      remaining,
+      resetAt: nextThaiMonthIso()
+    };
+  }
+  // default FREE
+  const limit = LIMITS.freeDaily;
+  const remaining = Math.max(0, limit - usedToday);
+  return {
+    plan: "free",
+    window: "daily",
+    limit,
+    used: usedToday,
+    remaining,
+    resetAt: nextThaiMidnightIso()
+  };
+}
+;
 
 function quotaGuard() {
   return async (req, res, next) => {
@@ -389,11 +541,14 @@ function quotaGuard() {
       // FREE: 20/day
       if (plan === "free") {
         if (usedToday >= LIMITS.freeDaily) {
+          const usage = { usedToday, usedMonth, dateKey, monthKey };
           return res.status(402).json({
             error: "quota_exceeded",
             message: `ใช้โควตาครบแล้ว (${LIMITS.freeDaily} ครั้ง/วัน) กรุณาอัปเกรดแพ็กเกจ`,
             plan,
-            usage: { usedToday, usedMonth, dateKey, monthKey },
+            usage,
+            usageSummary: usageSummary(plan, usage),
+            requestId: req.requestId || null
           });
         }
         req.usage = { usedToday, usedMonth, dateKey, monthKey };
@@ -403,11 +558,14 @@ function quotaGuard() {
       // BASIC: 300/month
       if (plan === "basic") {
         if (usedMonth >= LIMITS.basicMonthly) {
+          const usage = { usedToday, usedMonth, dateKey, monthKey };
           return res.status(402).json({
             error: "quota_exceeded",
             message: `ใช้โควตาครบแล้ว (${LIMITS.basicMonthly} ครั้ง/เดือน) กรุณาอัปเกรดแพ็กเกจ`,
             plan,
-            usage: { usedToday, usedMonth, dateKey, monthKey },
+            usage,
+            usageSummary: usageSummary(plan, usage),
+            requestId: req.requestId || null
           });
         }
         req.usage = { usedToday, usedMonth, dateKey, monthKey };
@@ -563,44 +721,388 @@ async function callGeminiGenerateContent({ prompt, temperature = 0.6, maxOutputT
   throw err;
 }
 
+// ------------------------
+// Backend JSON normalization helpers
+// ------------------------
+
+function stripCodeFences(s = "") {
+  const t = String(s || "").trim();
+  // Remove markdown code fences if the model returns them.
+  if (t.startsWith("```")) {
+    return t
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/```\s*$/i, "")
+      .trim();
+  }
+  return t;
+}
+
+function extractFirstJsonBlob(text) {
+  const s = stripCodeFences(text);
+  // Try to find a JSON object/array in a larger string.
+  const objStart = s.indexOf("{");
+  const arrStart = s.indexOf("[");
+  let start = -1;
+  if (objStart === -1) start = arrStart;
+  else if (arrStart === -1) start = objStart;
+  else start = Math.min(objStart, arrStart);
+  if (start === -1) return null;
+
+  // Walk and balance braces/brackets.
+  const opening = s[start];
+  const closing = opening === "{" ? "}" : "]";
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) {
+        esc = false;
+      } else if (ch === "\\") {
+        esc = true;
+      } else if (ch === '"') {
+        inStr = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+      continue;
+    }
+    if (ch === opening) depth++;
+    if (ch === closing) depth--;
+    if (depth === 0) {
+      return s.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+function tryParseJson(text) {
+  const blob = extractFirstJsonBlob(text);
+  if (!blob) return { ok: false, value: null };
+  try {
+    return { ok: true, value: JSON.parse(blob) };
+  } catch {
+    return { ok: false, value: null };
+  }
+}
+
+function pickFirst(obj, keys) {
+  for (const k of keys) {
+    if (obj && Object.prototype.hasOwnProperty.call(obj, k) && obj[k] != null) return obj[k];
+  }
+  return undefined;
+}
+
+function normalizeTrendItem(raw, idx) {
+  const r = raw && typeof raw === "object" ? raw : {};
+  const title = String(pickFirst(r, ["title", "trend", "topic", "headline", "name"]) || `Trending #${idx + 1}`).trim();
+  const tiktokUrl = String(pickFirst(r, ["tiktokUrl", "url", "link", "tiktok", "openTikTokUrl"]) || "").trim();
+  const hook = String(pickFirst(r, ["hook", "theHook", "hook_th", "hook_thai"]) || "").trim();
+  const whyViral = String(pickFirst(r, ["why_viral", "whyViral", "analysis", "reason", "why", "whyItsViral"]) || "").trim();
+  const contentIdea = String(pickFirst(r, ["contentIdea", "idea", "content", "concept", "howTo", "recommendation"]) || "").trim();
+  const imagePrompt = String(pickFirst(r, ["imagePrompt", "prompt", "thumbnailPrompt", "midjourneyPrompt"]) || "").trim();
+
+  return {
+    id: idx + 1,
+    title,
+    tiktokUrl,
+    hook,
+    why_viral: whyViral,
+    contentIdea,
+    imagePrompt,
+  };
+}
+
+function normalizeTrendsPayload(parsed) {
+  // Goal: always return { trends: [10 items] } even when the model returns odd JSON shapes.
+  // Accept many variants:
+  // - {trends:[...]} / {items:[...]} / {results:[...]} / {data:[...]} / {top10:[...]}
+  // - {trends:{1:{...},2:{...}}}  (object)
+  // - {trend1:{...}, trend2:{...}} or {"1":{...},"2":{...}}
+  // - nested containers like {data:{trends:[...]}} or {output:{items:[...]}}
+  let list = [];
+
+  const asListFromMaybe = (maybe) => {
+    if (!maybe) return null;
+    if (Array.isArray(maybe)) return maybe;
+    if (typeof maybe === "object") return Object.values(maybe);
+    return null;
+  };
+
+  const dig = (obj, depth = 0) => {
+    if (!obj || typeof obj !== "object" || depth > 2) return null;
+    const directKeys = ["trends", "items", "results", "data", "top10", "topTrends", "trending", "topics", "trendList", "list"];
+    for (const k of directKeys) {
+      if (Object.prototype.hasOwnProperty.call(obj, k)) {
+        const got = asListFromMaybe(obj[k]);
+        if (got && got.length) return got;
+      }
+    }
+    // If object has keys trend1..trend10 or 1..10, collect in order
+    const keys = Object.keys(obj);
+    const numeric = keys.filter(k => /^\d+$/.test(k)).sort((a,b)=>Number(a)-Number(b));
+    const trendN = keys.filter(k => /^trend\d+$/i.test(k)).sort((a,b)=>Number(a.replace(/\D/g,''))-Number(b.replace(/\D/g,'')));
+    if (numeric.length) return numeric.map(k => obj[k]);
+    if (trendN.length) return trendN.map(k => obj[k]);
+    // Otherwise try one-level nested objects
+    for (const k of keys) {
+      const child = obj[k];
+      const got = dig(child, depth + 1);
+      if (got && got.length) return got;
+    }
+    return null;
+  };
+
+  if (Array.isArray(parsed)) list = parsed;
+  else list = dig(parsed) || [];
+
+  const slice = list.slice(0, 10);
+  const normalized = slice.map((t, i) => normalizeTrendItem(t, i));
+  const extractedCount = normalized.filter((it, i) => it.title && it.title !== `Trending #${i + 1}`).length;
+
+  // If fewer than 10, pad with safe placeholders so UI never breaks.
+  while (normalized.length < 10) {
+    normalized.push(normalizeTrendItem({}, normalized.length));
+  }
+
+  return { trends: normalized, _extractedCount: extractedCount };
+}
+
+
+// ------------------------------
+// Review JSON "Lock" helpers (v41 production hardened)
+// ------------------------------
+function normalizeString(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'string') return v.trim();
+  return String(v).trim();
+}
+
+function normalizeStringArray(v) {
+  if (Array.isArray(v)) return v.map(normalizeString).filter(Boolean);
+  if (typeof v === 'string') {
+    return v
+      .split(/\r?\n|•|\u2022|\-|\*|\d+\)|\d+\.|\u25CF/g)
+      .map(s => s.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function normalizeReviewPayload(obj) {
+  const o = (obj && typeof obj === 'object') ? obj : {};
+  let script30s = normalizeString(o.script30s ?? o.script ?? o.script_30s ?? o['30sScript'] ?? o.text ?? o.output ?? '');
+  let pov = normalizeString(o.pov ?? o.POV ?? o.concept ?? o['pov_concept'] ?? '');
+  let hooks = normalizeStringArray(o.hooks ?? o.Hooks ?? o.hook ?? o.hookList ?? []);
+  let values = normalizeStringArray(o.values ?? o.Values ?? o.value ?? o.valueList ?? []);
+  let ctas = normalizeStringArray(o.ctas ?? o.CTAs ?? o.cta ?? o.ctaList ?? []);
+
+  // Enforce lengths
+  if (hooks.length > 5) hooks = hooks.slice(0, 5);
+  if (values.length > 3) values = values.slice(0, 3);
+  if (ctas.length > 3) ctas = ctas.slice(0, 3);
+  while (hooks.length < 5) hooks.push('');
+  while (values.length < 3) values.push('');
+  while (ctas.length < 3) ctas.push('');
+
+  // If script is missing but we have other text fields, fallback
+  if (!script30s) script30s = normalizeString(o.raw ?? o.result ?? '');
+
+  return { script30s, pov, hooks, values, ctas };
+}
+
+function validateReviewPayload(payload) {
+  const p = payload || {};
+  const errs = [];
+  if (!p || typeof p !== 'object') errs.push('payload_not_object');
+  if (!normalizeString(p.script30s)) errs.push('missing_script30s');
+  if (!Array.isArray(p.hooks) || p.hooks.length !== 5) errs.push('hooks_not_5');
+  if (!Array.isArray(p.values) || p.values.length !== 3) errs.push('values_not_3');
+  if (!Array.isArray(p.ctas) || p.ctas.length !== 3) errs.push('ctas_not_3');
+  return { ok: errs.length === 0, errors: errs };
+}
+
+const REVIEW_RESPONSE_SCHEMA = {
+  type: "object",
+  properties: {
+    script30s: { type: "string" },
+    pov: { type: "string" },
+    hooks: { type: "array", items: { type: "string" }, minItems: 5, maxItems: 5 },
+    values: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 3 },
+    ctas: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 3 }
+  },
+  required: ["script30s", "pov", "hooks", "values", "ctas"]
+};
+
+async function generateLockedReviewJson(model, basePrompt, options = {}) {
+  // Two-layer hardening:
+  // 1) Ask model for strict JSON (application/json + schema)
+  // 2) Validate; if invalid, repair with a second call; if still invalid, return normalized best-effort object
+  const temperature = typeof options.temperature === 'number' ? options.temperature : 0.6;
+  const maxOutputTokens = typeof options.maxOutputTokens === 'number' ? options.maxOutputTokens : 1200;
+
+  const generationConfig = {
+    temperature,
+    maxOutputTokens,
+    responseMimeType: "application/json",
+    responseSchema: REVIEW_RESPONSE_SCHEMA
+  };
+
+  const strictPrompt = [
+    "OUTPUT MUST BE VALID JSON ONLY.",
+    "No markdown fences. No extra keys.",
+    "Schema: {script30s:string, pov:string, hooks:[5 strings], values:[3 strings], ctas:[3 strings]}",
+    "",
+    basePrompt
+  ].join("\n");
+
+  let text1 = '';
+  try {
+    const r1 = await model.generateContent({ contents: [{ role: "user", parts: [{ text: strictPrompt }] }], generationConfig });
+    text1 = (r1?.response?.text?.() || '').trim();
+  } catch (e) {
+    // fall through to repair/normalize
+    text1 = '';
+  }
+
+  let parsed1 = tryParseJson(text1);
+  if (parsed1.ok) {
+    const norm = normalizeReviewPayload(parsed1.value);
+    const v = validateReviewPayload(norm);
+    if (v.ok) return { ok: true, json: norm, rawText: text1, repaired: false };
+  }
+
+  // Repair attempt: send original output and ask to fix
+  const repairPrompt = [
+    "You returned INVALID JSON. Fix it.",
+    "Return ONLY valid JSON matching the schema exactly.",
+    "No markdown fences. No explanations.",
+    "",
+    "INVALID_OUTPUT:",
+    text1 ? text1.slice(0, 6000) : "(empty)"
+  ].join("\n");
+
+  let text2 = '';
+  try {
+    const r2 = await model.generateContent({ contents: [{ role: "user", parts: [{ text: repairPrompt }] }], generationConfig });
+    text2 = (r2?.response?.text?.() || '').trim();
+  } catch (e) {
+    text2 = '';
+  }
+
+  let parsed2 = tryParseJson(text2);
+  if (parsed2.ok) {
+    const norm = normalizeReviewPayload(parsed2.value);
+    const v = validateReviewPayload(norm);
+    if (v.ok) return { ok: true, json: norm, rawText: text2, repaired: true };
+  }
+
+  // Final fallback: best-effort normalization (never crash the frontend)
+  const fallbackObj = normalizeReviewPayload(parsed1.ok ? parsed1.value : {});
+  if (!fallbackObj.script30s) fallbackObj.script30s = normalizeString(text1 || text2 || basePrompt);
+  const v3 = validateReviewPayload(fallbackObj);
+  return { ok: v3.ok, json: fallbackObj, rawText: text1 || text2, repaired: true, fallback: true, errors: v3.errors };
+}
+
+
+function looksLikeTrendsPayload(obj) {
+  return !!(obj && typeof obj === "object" && Array.isArray(obj.trends));
+}
+
 app.post("/api/gemini-text", authRequired, hydrateUserPlan, quotaGuard(), async (req, res) => {
   try {
-    const { prompt, responseMimeType, useSearch, temperature } = req.body || {};
+    const { prompt, responseMimeType, useSearch, temperature, maxOutputTokens, meta } = req.body || {};
+
+    const requestId = req.requestId || (crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2, 8)));
+const { cacheKey, cacheTtlSec } = (req.body || {});
+if (cacheKey) {
+  const cached = cacheGet(String(cacheKey));
+  if (cached) {
+    res.setHeader("X-Cache", "HIT");
+    const usage = await bumpUsage(req.user.id);
+    return res.json({ ...cached, requestId, cached: true, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+  }
+  res.setHeader("X-Cache", "MISS");
+}
+
     if (!prompt) return res.status(400).json({ error: "prompt_required" });
 
-    const { text: aiText, modelUsed, apiVersion } = await callGeminiGenerateContent({
-      prompt: String(prompt),
-      useSearch: !!useSearch,
-      responseMimeType: responseMimeType ? String(responseMimeType) : undefined,
-      temperature: (typeof temperature === 'number' ? temperature : 0.6),
-      maxOutputTokens: 2048,
-    });
+    const mimeRequested = responseMimeType ? String(responseMimeType) : undefined;
 
-    const usage = await bumpUsage(req.user.id);
-    return res.json({ text: aiText, modelUsed, apiVersion, usage });
-  } catch (err) {
-    console.error("gemini-text error", err?.body || err);
-    if (err?.status === 429 || isUpstreamRateLimited(err)) {
-      return res.status(429).json({ error: "rate_limited", message: "ระบบกำลังหนาแน่น กรุณาลองใหม่อีกครั้ง" });
+    // Viral Finder MUST be stable: always return exactly 10 trends.
+    // Even if the frontend forgets to request JSON, force JSON mode for Viral Finder.
+    // The frontend can also set explicit flags (forceTrends / viralCategory / category).
+    const promptText = String(prompt);
+    const forceTrends = !!req.body.forceTrends;
+    const viralCategory = req.body.viralCategory || req.body.category || (meta && meta.viralCategory);
+    const wantsTrends = (
+      forceTrends ||
+      !!viralCategory ||
+      (meta && typeof meta === "object" && meta.tool === "viral_finder_trends") ||
+      /viral\s*f\w*nder|viral\s*finder|trending\s*1-?10|\"trends\"\s*:|\btrends\b/i.test(promptText)
+    );
+
+    const effectiveMime = wantsTrends ? "application/json" : mimeRequested;
+    const wantsJson = effectiveMime === "application/json";
+
+    const VIRAL_STRICT_JSON_PREFIX = `You are a JSON API. Return ONLY valid JSON. No markdown, no commentary.
+
+Schema (MUST follow exactly):
+{
+  "category": string,
+  "trends": [
+    {
+      "rank": 1,
+      "title": string,
+      "hook": string,
+      "reason": string,
+      "idea": string,
+      "prompt": string,
+      "tiktokUrl": string
     }
-    return res.status(500).json({ error: "gemini_error", message: "ระบบขัดข้อง กรุณาลองใหม่อีกครั้ง" });
-  }
-});
+  ]
+}
 
-// ------------------------
-// Extra API routes for static HTML build (replacing Netlify Functions)
-// ------------------------
-app.post("/api/geminiHook", async (req, res) => {
-  try {
-    const { transcript = "", language = "th" } = req.body || {};
-    const safeTranscript = String(transcript || "").slice(0, 8000);
+Rules:
+- "trends" MUST be an array with EXACTLY 10 items (rank 1..10). No fewer, no more.
+- Each title MUST be a distinct TikTok trend/topic for the requested category. Avoid duplicates.
+- tiktokUrl MUST be a valid-looking TikTok URL (https://www.tiktok.com/...) relevant to the title. If you are unsure, still provide a plausible TikTok search URL format.
+- Keep hook/reason/idea/prompt concise (1-2 lines each).
+`;
 
-    // If no transcript, return a safe default
-    if (!safeTranscript.trim()) {
-      return res.json({ hookStart: 0, hookDuration: 3, rationale: "No transcript provided" });
+    const finalPrompt = wantsTrends
+      ? `${VIRAL_STRICT_JSON_PREFIX}\n\nUSER_REQUEST:\n${promptText}`
+      : promptText;
+
+    const runOnce = async (p) => {
+      return await callGeminiGenerateContent({
+        prompt: p,
+        useSearch: wantsTrends ? true : !!useSearch,
+        responseMimeType: effectiveMime,
+        temperature: (typeof temperature === "number" ? temperature : (wantsJson ? 0.4 : 0.6)),
+        maxOutputTokens: 2048,
+      });
+    };
+
+    let { text: aiText, modelUsed, apiVersion } = await runOnce(finalPrompt);
+    let finalText = aiText;
+
+    if (wantsJson) {
+      // Try parse JSON response; if parsing fails, still return raw text.
+      try {
+        const json = JSON.parse(finalText);
+        const usage = await bumpUsage(req.user.id);
+        return res.json({ ok: true, json, requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+      } catch (e) {
+        const usage = await bumpUsage(req.user.id);
+        return res.json({ ok: true, text: finalText, requestId, json_parse_error: String(e && e.message ? e.message : e) , plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+      }
     }
 
-    const prompt = [
+    const hookPrompt = [
       "You are a video editor assistant.",
       "Given a short transcript, estimate the best hook segment for a short-form video.",
       "Return ONLY valid JSON with keys: hookStart (number, seconds), hookDuration (number, seconds), rationale (string).",
@@ -617,7 +1119,7 @@ app.post("/api/geminiHook", async (req, res) => {
 
     // Ask Gemini for strict JSON
     const out = await callGeminiGenerateContent({
-      prompt,
+      prompt: hookPrompt.join("\n"),
       temperature: 0.3,
       maxOutputTokens: 256,
       responseMimeType: "application/json",
@@ -636,14 +1138,27 @@ app.post("/api/geminiHook", async (req, res) => {
       parsed = match ? JSON.parse(match[0]) : null;
     }
 
+    // count usage once per request (even if output is invalid)
+    const usage = await bumpUsage(req.user.id);
+
     if (!parsed || typeof parsed !== "object") {
-      return res.json({ hookStart: 0, hookDuration: 3, rationale: "Fallback (invalid model output)" });
+      return res.json({
+        plan: String(req.user.plan || "free").toLowerCase(),
+        usage,
+        usageSummary: usageSummary(req.user.plan, usage),
+        hookStart: 0,
+        hookDuration: 3,
+        rationale: "Fallback (invalid model output)"
+      });
     }
 
     const hookStart = Number(parsed.hookStart);
     const hookDuration = Number(parsed.hookDuration);
 
     return res.json({
+      plan: String(req.user.plan||"free").toLowerCase(),
+      usage,
+      usageSummary: usageSummary(req.user.plan, usage),
       hookStart: Number.isFinite(hookStart) ? Math.max(0, hookStart) : 0,
       hookDuration: Number.isFinite(hookDuration) ? Math.min(6, Math.max(2, hookDuration)) : 3,
       rationale: String(parsed.rationale || "")
@@ -770,20 +1285,91 @@ function paddleApiBase() {
   return PADDLE_ENV === "live" ? "https://api.paddle.com" : "https://sandbox-api.paddle.com";
 }
 
+// ---------- USER / USAGE (Soft gate support) ----------
+app.get("/api/user", authRequired, hydrateUserPlan, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const plan = String(req.user.plan || "free").toLowerCase();
+    const dateKey = thaiDateKey();
+    const monthKey = thaiMonthKey();
+    const usedToday = await getDailyCount(userId, dateKey);
+    const usedMonth = await getMonthlyCount(userId, monthKey);
+    const usage = { usedToday, usedMonth, dateKey, monthKey };
+    return res.json({
+      ok: true,
+      user: { id: userId, email: req.user.email, plan },
+      limits: LIMITS,
+      usage,
+      usageSummary: usageSummary(plan, usage),
+      requestId: req.requestId || null
+    });
+  } catch (err) {
+    console.error("GET /api/user error", err);
+    return res.status(500).json({ ok: false, error: "internal_error", requestId: req.requestId || null });
+  }
+});
+
+app.get("/api/usage", authRequired, hydrateUserPlan, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const plan = String(req.user.plan || "free").toLowerCase();
+    const dateKey = thaiDateKey();
+    const monthKey = thaiMonthKey();
+    const usedToday = await getDailyCount(userId, dateKey);
+    const usedMonth = await getMonthlyCount(userId, monthKey);
+    const usage = { usedToday, usedMonth, dateKey, monthKey };
+    return res.json({
+      ok: true,
+      plan,
+      limits: LIMITS,
+      usage,
+      usageSummary: usageSummary(plan, usage),
+      requestId: req.requestId || null
+    });
+  } catch (err) {
+    console.error("GET /api/usage error", err);
+    return res.status(500).json({ ok: false, error: "internal_error", requestId: req.requestId || null });
+  }
+});
+// ---------- /USER / USAGE ----------
+
 app.post("/api/paddle/create-checkout", authRequired, hydrateUserPlan, async (req, res) => {
   try {
-    const { priceId } = req.body || {};
-    if (!priceId) return res.status(400).json({ error: "priceId_required" });
+    // Accept either { plan: "basic"|"pro" } OR { priceId: "pri_..." } for backward compatibility
+    const { plan: planRaw, priceId: priceIdRaw } = req.body || {};
+    const plan = String(planRaw || "").toLowerCase().trim();
 
-    const plan = PRICE_TO_PLAN[priceId];
-    if (!plan) return res.status(400).json({ error: "unknown_price_id" });
+    // Map plan -> priceId (preferred)
+    const planToPrice = {
+      basic: PADDLE_BASIC_PRICE_ID,
+      pro: PADDLE_PRO_PRICE_ID,
+    };
+
+    let priceId = priceIdRaw ? String(priceIdRaw).trim() : "";
+    let resolvedPlan = "";
+
+    if (plan) {
+      if (!["basic", "pro"].includes(plan)) return res.status(400).json({ error: "unknown_plan" });
+      const mapped = planToPrice[plan];
+      if (!mapped) return res.status(500).json({ error: "paddle_price_not_configured" });
+      priceId = mapped;
+      resolvedPlan = plan;
+    } else if (priceId) {
+      resolvedPlan = PRICE_TO_PLAN[priceId];
+      if (!resolvedPlan) return res.status(400).json({ error: "unknown_price_id" });
+    } else {
+      return res.status(400).json({ error: "plan_or_priceId_required" });
+    }
 
     if (!PADDLE_API_KEY) return res.status(500).json({ error: "paddle_not_configured" });
+    if (!CHECKOUT_SUCCESS_URL || !CHECKOUT_CANCEL_URL) {
+      return res.status(500).json({ error: "checkout_url_not_configured" });
+    }
 
     const body = {
       items: [{ price_id: priceId, quantity: 1 }],
       customer: { email: req.user.email },
-      metadata: { user_id: req.user.id, requested_plan: plan },
+      metadata: { user_id: req.user.id, requested_plan: resolvedPlan },
       success_url: CHECKOUT_SUCCESS_URL,
       cancel_url: CHECKOUT_CANCEL_URL,
     };
@@ -803,10 +1389,19 @@ app.post("/api/paddle/create-checkout", authRequired, hydrateUserPlan, async (re
       return res.status(500).json({ error: "paddle_error", message: "สร้าง checkout ไม่สำเร็จ" });
     }
 
-    return res.json({ sessionId: session?.id, checkoutUrl, plan });
+    // IMPORTANT: frontend expects {url}
+    return res.json({
+      ok: true,
+      url: checkoutUrl,
+      checkoutUrl, // keep old field too
+      sessionId: session?.id || null,
+      plan: resolvedPlan,
+      priceId,
+      requestId: req.requestId || null,
+    });
   } catch (err) {
     console.error("create-checkout error", err?.response?.data || err);
-    return res.status(500).json({ error: "paddle_error", message: "Paddle error" });
+    return res.status(500).json({ error: "paddle_error", message: "Paddle error", requestId: req.requestId || null });
   }
 });
 
