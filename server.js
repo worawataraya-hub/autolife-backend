@@ -110,6 +110,14 @@ const PADDLE_PRO_PRICE_ID = process.env.PADDLE_PRO_PRICE_ID;
 
 const CHECKOUT_SUCCESS_URL = process.env.CHECKOUT_SUCCESS_URL;
 const CHECKOUT_CANCEL_URL = process.env.CHECKOUT_CANCEL_URL;
+// ---------- Helpers ----------
+function cleanHeaderValue(v) {
+  let s = String(v ?? "").replace(/[\r\n]+/g, "").trim();
+  // Allow env to be either raw token or "Bearer <token>"
+  if (/^Bearer\s+/i.test(s)) s = s.replace(/^Bearer\s+/i, "");
+  return s;
+}
+
 
 // ---------- VALIDATION ----------
 function must(name, value) {
@@ -1334,6 +1342,10 @@ app.get("/api/usage", authRequired, hydrateUserPlan, async (req, res) => {
 // ---------- /USER / USAGE ----------
 
 app.post("/api/paddle/create-checkout", authRequired, hydrateUserPlan, async (req, res) => {
+  const paddleKey = cleanHeaderValue(PADDLE_API_KEY);
+  if (!paddleKey) {
+    return res.status(500).json({ error: "missing_paddle_api_key" });
+  }
   try {
     // Accept either { plan: "basic"|"pro" } OR { priceId: "pri_..." } for backward compatibility
     const { plan: planRaw, priceId: priceIdRaw } = req.body || {};
@@ -1376,7 +1388,7 @@ app.post("/api/paddle/create-checkout", authRequired, hydrateUserPlan, async (re
 
     const resp = await axios.post(`${paddleApiBase()}/checkout/sessions`, body, {
       headers: {
-        Authorization: `Bearer ${PADDLE_API_KEY}`,
+        Authorization: `Bearer ${paddleKey}`,
         "Content-Type": "application/json",
       },
     });
