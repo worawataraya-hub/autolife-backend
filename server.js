@@ -1329,14 +1329,26 @@ function safeUrl(url, name) {
  * then the frontend can restore location.hash if desired.
  */
 function normalizeCheckoutUrlForPaddle(urlStr) {
+  // Paddle validates these URLs and often rejects fragments (#...).
+  // For hash routers like `/#pricing?success=1`, we:
+  //   - move the hash route into `paddle_return`
+  //   - merge any hash query (?a=1) into the real querystring
+  //   - strip the fragment entirely
   const u = new URL(urlStr);
-  const hash = u.hash || "";
-  if (hash && hash.length > 1) {
-    const frag = hash.slice(1);
+
+  if (u.hash && u.hash.length > 1) {
+    const fragRaw = u.hash.slice(1); // remove '#'
+    const [fragRoute, fragQuery] = fragRaw.split("?", 2);
+
+    if (fragRoute) u.searchParams.set("paddle_return", fragRoute);
+
+    if (fragQuery) {
+      const qp = new URLSearchParams(fragQuery);
+      for (const [k, v] of qp.entries()) u.searchParams.set(k, v);
+    }
     u.hash = "";
-    // Preserve the fragment in a query param
-    if (!u.searchParams.has("paddle_hash")) u.searchParams.set("paddle_hash", frag);
   }
+
   return u.toString();
 }
 
