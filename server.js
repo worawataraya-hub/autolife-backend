@@ -1323,6 +1323,23 @@ function safeUrl(url, name) {
   }
 }
 
+/**
+ * Paddle sometimes rejects URLs with fragments (#...).
+ * We keep the intended fragment by moving it into a query param `paddle_hash`,
+ * then the frontend can restore location.hash if desired.
+ */
+function normalizeCheckoutUrlForPaddle(urlStr) {
+  const u = new URL(urlStr);
+  const hash = u.hash || "";
+  if (hash && hash.length > 1) {
+    const frag = hash.slice(1);
+    u.hash = "";
+    // Preserve the fragment in a query param
+    if (!u.searchParams.has("paddle_hash")) u.searchParams.set("paddle_hash", frag);
+  }
+  return u.toString();
+}
+
 
 // ---------- USER / USAGE (Soft gate support) ----------
 app.get("/api/user", authRequired, hydrateUserPlan, async (req, res) => {
@@ -1409,8 +1426,14 @@ app.post("/api/paddle/create-checkout", authRequired, hydrateUserPlan, async (re
       return res.status(500).json({ error: "checkout_url_not_configured" });
     }
 
-    const successUrl = safeUrl(CHECKOUT_SUCCESS_URL, 'CHECKOUT_SUCCESS_URL');
-    const cancelUrl  = safeUrl(CHECKOUT_CANCEL_URL, 'CHECKOUT_CANCEL_URL');
+    let successUrl;
+    let cancelUrl;
+    try {
+      successUrl = normalizeCheckoutUrlForPaddle(safeUrl(CHECKOUT_SUCCESS_URL, 'CHECKOUT_SUCCESS_URL'));
+      cancelUrl  = normalizeCheckoutUrlForPaddle(safeUrl(CHECKOUT_CANCEL_URL, 'CHECKOUT_CANCEL_URL'));
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: 'invalid_env', message: e.message, requestId: req.requestId || null });
+    }
 
     const body = {
       items: [{ price_id: priceId, quantity: 1 }],
