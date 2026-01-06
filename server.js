@@ -1445,15 +1445,46 @@ app.post("/api/paddle/create-checkout", authRequired, hydrateUserPlan, async (re
       },
     };
 
-    const resp = await axios.post(`${paddleApiBase()}/checkout/sessions`, body, {
+// Paddle has changed/renamed some endpoints over time. Try a small set of known candidates.
+const endpoints = ["/checkout/sessions", "/checkouts/sessions"];
+let resp;
+let lastErr;
+
+for (const ep of endpoints) {
+  const url = `${paddleApiBase()}${ep}`;
+  try {
+    resp = await axios.post(url, body, {
       headers: {
         Authorization: `Bearer ${paddleKey}`,
         "Content-Type": "application/json",
       },
     });
+    lastErr = null;
+    break;
+  } catch (e) {
+    lastErr = e;
+    const status = e?.response?.status;
+    const pdata = e?.response?.data;
+    const code = pdata?.error?.code || pdata?.error?.type || pdata?.code;
+
+    console.error("paddle create-checkout attempt failed", {
+      url,
+      status,
+      code,
+      response: pdata,
+    });
+
+    // If it's clearly an endpoint/URL mismatch from Paddle, try the next candidate.
+    const isInvalidUrl404 =
+      status === 404 && (code === "invalid_url" || code === "request_error");
+    if (!isInvalidUrl404) throw e;
+  }
+}
+
+if (!resp && lastErr) throw lastErr;
 
     const session = resp.data?.data || resp.data;
-    const checkoutUrl = session?.checkout_url;
+    const checkoutUrl = session?.checkout_url || session?.url || session?.checkout?.url;
 
     if (!checkoutUrl) {
       console.error("Paddle session missing checkout_url", resp.data);
