@@ -1315,6 +1315,15 @@ function normalizeRedirectUrl(url) {
   return qs ? `${base}/?${qs}` : `${base}/`;
 }
 
+function safeUrl(url, name) {
+  try {
+    return new URL(url).toString();
+  } catch (e) {
+    throw new Error(`Invalid ${name}: ${url}`);
+  }
+}
+
+
 // ---------- USER / USAGE (Soft gate support) ----------
 app.get("/api/user", authRequired, hydrateUserPlan, async (req, res) => {
   try {
@@ -1400,12 +1409,17 @@ app.post("/api/paddle/create-checkout", authRequired, hydrateUserPlan, async (re
       return res.status(500).json({ error: "checkout_url_not_configured" });
     }
 
+    const successUrl = safeUrl(CHECKOUT_SUCCESS_URL, 'CHECKOUT_SUCCESS_URL');
+    const cancelUrl  = safeUrl(CHECKOUT_CANCEL_URL, 'CHECKOUT_CANCEL_URL');
+
     const body = {
       items: [{ price_id: priceId, quantity: 1 }],
       customer: { email: req.user.email },
       metadata: { user_id: req.user.id, requested_plan: resolvedPlan },
-      success_url: normalizeRedirectUrl(CHECKOUT_SUCCESS_URL),
-      cancel_url: normalizeRedirectUrl(CHECKOUT_CANCEL_URL),
+      checkout: {
+        success_url: successUrl,
+        cancel_url: cancelUrl
+      },
     };
 
     const resp = await axios.post(`${paddleApiBase()}/checkout/sessions`, body, {
