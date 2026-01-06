@@ -1293,6 +1293,28 @@ function paddleApiBase() {
   return PADDLE_ENV === "live" ? "https://api.paddle.com" : "https://sandbox-api.paddle.com";
 }
 
+
+
+function normalizeRedirectUrl(url) {
+  // Paddle rejects URLs with hash fragments (#...). Convert them to query param `paddle_return`.
+  // Example: https://site.app/#pricing?success=1 -> https://site.app/?paddle_return=pricing%3Fsuccess%3D1
+  if (!url || typeof url !== "string") return "";
+  const raw = url.trim();
+  if (!raw) return "";
+  if (!raw.includes("#")) return raw;
+
+  const [baseWithQuery, fragRaw = ""] = raw.split("#");
+  const [baseNoQuery, baseQuery = ""] = baseWithQuery.split("?");
+  const base = baseNoQuery.replace(/\/$/, "");
+
+  const frag = fragRaw.replace(/^\//, ""); // drop leading "/"
+  const qp = new URLSearchParams(baseQuery);
+  if (frag) qp.set("paddle_return", frag);
+
+  const qs = qp.toString();
+  return qs ? `${base}/?${qs}` : `${base}/`;
+}
+
 // ---------- USER / USAGE (Soft gate support) ----------
 app.get("/api/user", authRequired, hydrateUserPlan, async (req, res) => {
   try {
@@ -1382,8 +1404,8 @@ app.post("/api/paddle/create-checkout", authRequired, hydrateUserPlan, async (re
       items: [{ price_id: priceId, quantity: 1 }],
       customer: { email: req.user.email },
       metadata: { user_id: req.user.id, requested_plan: resolvedPlan },
-      success_url: CHECKOUT_SUCCESS_URL,
-      cancel_url: CHECKOUT_CANCEL_URL,
+      success_url: normalizeRedirectUrl(CHECKOUT_SUCCESS_URL),
+      cancel_url: normalizeRedirectUrl(CHECKOUT_CANCEL_URL),
     };
 
     const resp = await axios.post(`${paddleApiBase()}/checkout/sessions`, body, {
