@@ -1471,8 +1471,30 @@ app.post("/api/paddle/create-checkout", authRequired, hydrateUserPlan, async (re
       requestId: req.requestId || null,
     });
   } catch (err) {
-    console.error("create-checkout error", err?.response?.data || err);
-    return res.status(500).json({ error: "paddle_error", message: "Paddle error", requestId: req.requestId || null });
+    const paddleStatus = err?.response?.status;
+    const paddleData = err?.response?.data;
+
+    // Log structured info so Render logs show the real Paddle validation error
+    console.error("create-checkout error", {
+      requestId: req.requestId || null,
+      paddleStatus,
+      paddleData,
+      message: err?.message,
+    });
+
+    // Bubble up Paddle's HTTP status when possible (usually 4xx),
+    // so the frontend can display a useful message instead of a 500.
+    const status = (typeof paddleStatus === 'number' && paddleStatus >= 400 && paddleStatus <= 599)
+      ? paddleStatus
+      : 500;
+
+    return res.status(status).json({
+      error: "paddle_error",
+      message: "Paddle error",
+      requestId: req.requestId || null,
+      paddleStatus: paddleStatus || null,
+      paddle: paddleData || null,
+    });
   }
 });
 
