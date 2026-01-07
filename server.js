@@ -1490,48 +1490,49 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
 
     const endpoints = ["/transactions", "/checkout/sessions", "/checkouts/sessions"];
 
-    const buildPayload = (endpoint) => {
-    // Paddle Billing (Transactions API)
-    if (endpoint === "/transactions") {
-      const payload = {
-        items: [{ price_id: priceId, quantity: 1 }],
-        customer: email ? { email } : undefined,
-        checkout: {
-          success_url: CHECKOUT_SUCCESS_URL,
-          cancel_url: CHECKOUT_CANCEL_URL,
-        },
-        // keep context for webhook / plan mapping
-        custom_data: {
-          user: email,
-          plan: plan || (priceId === BASIC_PRICE_ID ? "basic" : "pro"),
-          priceId,
-          requestId,
-          source: "create-checkout",
-        },
-      };
-      Object.keys(payload).forEach((k) => payload[k] === undefined && delete payload[k]);
-      return payload;
-    }
+      const buildPayload = (endpoint) => {
+    // Paddle Billing v2:
+    // - /transactions expects "checkout" object
+    // - /checkout(s)/sessions expects top-level success_url / cancel_url
+    const baseItems = [{ price_id: priceId, quantity: 1 }];
 
-    // Fallback: Checkout Sessions endpoints (if enabled on the account)
-    const payload = {
-      items: [{ price_id: priceId, quantity: 1 }],
-      customer: email ? { email } : undefined,
-      checkout: {
-        success_url: CHECKOUT_SUCCESS_URL,
-        cancel_url: CHECKOUT_CANCEL_URL,
-      },
+    const common = {
       custom_data: {
-        user: email,
-        plan: plan || (priceId === BASIC_PRICE_ID ? "basic" : "pro"),
-        priceId,
+        planTarget,
+        userEmail: userEmail || null,
         requestId,
-        source: "create-checkout",
+        source: "pricing_modal",
+      },
+      metadata: {
+        planTarget,
+        userEmail: userEmail || null,
+        requestId,
       },
     };
-    Object.keys(payload).forEach((k) => payload[k] === undefined && delete payload[k]);
-    return payload;
-  };const extractCheckoutUrl = (data) =>
+
+    if (endpoint === "/transactions") {
+      return {
+        items: baseItems,
+        customer: customerEmail ? { email: customerEmail } : undefined,
+        checkout: {
+          success_url: successUrl,
+          cancel_url: cancelUrl,
+        },
+        ...common,
+      };
+    }
+
+    // Legacy/alternate checkout session endpoints
+    return {
+      items: baseItems,
+      customer_email: customerEmail || undefined,
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      ...common,
+    };
+  };
+
+const extractCheckoutUrl = (data) =>
       data?.data?.checkout?.url ||
       data?.data?.url ||
       data?.data?.checkout_url ||
