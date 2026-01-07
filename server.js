@@ -1435,146 +1435,156 @@ app.get("/api/usage", authRequired, hydrateUserPlan, async (req, res) => {
 // ---------- /USER / USAGE ----------
 
 app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
-  // Expected body: { plan: "basic" | "pro" }
+  const requestId = req.headers["x-request-id"] || crypto.randomUUID();
+
   try {
     const plan = String(req.body?.plan || "").toLowerCase();
+    const userEmail = req.user?.email;
 
-    const resolvePriceId = (k) => {
-      if (k === "basic") return process.env.PADDLE_BASIC_PRICE_ID || process.env.PADDLE_PRICE_ID_BASIC;
-      if (k === "pro") return process.env.PADDLE_PRO_PRICE_ID || process.env.PADDLE_PRICE_ID_PRO;
-      return null;
-    };
+    if (!userEmail) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
 
-    const priceId = (resolvePriceId(plan) || "").trim();
+    const priceId =
+      plan === "basic"
+        ? process.env.PADDLE_BASIC_PRICE_ID
+        : plan === "pro"
+          ? process.env.PADDLE_PRO_PRICE_ID
+          : null;
+
     if (!priceId) {
-      return res.status(400).json({ error: "missing_price_id", message: `Missing price id for plan: ${plan}` });
-    }
-
-    const apiKeyRaw = process.env.PADDLE_API_KEY || process.env.PADDLE_APIKEY || "";
-    const apiKey = cleanHeaderValue(apiKeyRaw);
-    if (!apiKey) {
-      return res.status(500).json({ error: "missing_paddle_key", message: "PADDLE_API_KEY is not configured" });
-    }
-
-    // NOTE: Paddle is strict about redirect URLs.
-    // - Must be absolute https URL
-    // - Should not contain fragments (#...)
-    // - Some accounts require whitelisting these URLs in Paddle settings.
-    const successUrlRaw = String(process.env.CHECKOUT_SUCCESS_URL || "").trim();
-    const cancelUrlRaw = String(process.env.CHECKOUT_CANCEL_URL || "").trim();
-
-    const successUrl = sanitizeRedirectUrl(successUrlRaw);
-    const cancelUrl = sanitizeRedirectUrl(cancelUrlRaw);
-
-    if (!successUrl || !cancelUrl) {
-      return res.status(500).json({
-        error: "missing_checkout_urls",
-        message: "CHECKOUT_SUCCESS_URL / CHECKOUT_CANCEL_URL are not configured (or invalid)",
-        sent: { successUrlRaw, cancelUrlRaw },
-      });
-    }
-
-    // Validate they're absolute URLs
-    try {
-      new URL(successUrl);
-      new URL(cancelUrl);
-    } catch {
-      return res.status(400).json({
-        error: "invalid_checkout_urls",
-        message: "CHECKOUT_SUCCESS_URL / CHECKOUT_CANCEL_URL must be absolute URLs (https://...)",
-        sent: { successUrl, cancelUrl },
-      });
+      return res.status(400).json({ error: "Invalid plan" });
     }
 
     const apiBase = paddleApiBase();
+
+    const rawSuccessUrl = process.env.CHECKOUT_SUCCESS_URL;
+    const rawCancelUrl = process.env.CHECKOUT_CANCEL_URL;
+
+    const successUrl = normalizeCheckoutUrlForPaddle(rawSuccessUrl);
+    const cancelUrl = normalizeCheckoutUrlForPaddle(rawCancelUrl);
+
+    if (!successUrl || !cancelUrl) {
+      return res.status(500).json({
+        error: "Missing checkout redirect URLs",
+        hint: "Set CHECKOUT_SUCCESS_URL and CHECKOUT_CANCEL_URL in Render env vars",
+      });
+    }
+
+    const apiKey = cleanHeaderValue(process.env.PADDLE_API_KEY || "");
+    if (!apiKey) {
+      return res.status(500).json({ error: "Missing PADDLE_API_KEY" });
+    }
+
     const headers = {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
-      Accept: "application/json",
+      "User-Agent": "autolife-backend/1.0",
     };
 
-    // Paddle Billing (API v2) — best effort:
-    // Prefer /transactions (modern) which returns checkout.url
-    const endpoint = '/checkouts/sessions';
+    // Paddle can respond with different shapes depending on API/feature flags.
+    // We'll try Transactions first, then fall back to Checkout Sessions.
+    const sent = { plan, priceId, successUrl, cancelUrl };
 
-    const payload = {
-      items: [{ price_id: priceId, quantity: 1 }],
-      success_url: successUrl,
-      cancel_url: cancelUrl,
-      ...(userEmail ? { customer: { email: userEmail } } : {}),
+    const tryTransactions = async () => {
+      const payload = {
+        items: [{ price_id: priceId, quantity: 1 }],
+        customer: { email: userEmail },
+        custom_data: { user: userEmail, plan },
+        checkout: { success_url: successUrl, cancel_url: cancelUrl },
+      };
+      return axios.post(`${apiBase}/transactions`, payload, { headers, timeout: 20000 });
     };
 
-    const requestId = crypto.randomUUID();
+    const tryCheckoutSessions = async () => {
+      const payload = {
+        items: [{ price_id: priceId, quantity: 1 }],
+        customer_email: userEmail,
+        success_url: successUrl,
+        cancel_url: cancelUrl,
+        custom_data: { user: userEmail, plan },
+      };
+      return axios.post(`${apiBase}/checkouts/sessions`, payload, { headers, timeout: 20000 });
+    };
 
-    const r = await axios.post(`${apiBase}${endpoint}`, payload, {
-      headers,
-      timeout: 20000,
-      validateStatus: () => true, // we'll handle errors explicitly
-    });
+    let r;
+    let lastError = null;
 
-    // Success path
+    try {
+      r = await tryTransactions();
+    } catch (e) {
+      lastError = {
+        endpoint: "/transactions",
+        status: e?.response?.status,
+        code: e?.response?.data?.error?.code,
+        response: e?.response?.data,
+        message: e?.message,
+      };
+      // If Transactions checkout is not enabled OR endpoint not found, try sessions.
+      const code = lastError.code;
+      const status = lastError.status;
+      if (code === "transaction_checkout_not_enabled" || status === 404 || status === 400) {
+        try {
+          r = await tryCheckoutSessions();
+          lastError = null;
+        } catch (e2) {
+          lastError = {
+            endpoint: "/checkouts/sessions",
+            status: e2?.response?.status,
+            code: e2?.response?.data?.error?.code,
+            response: e2?.response?.data,
+            message: e2?.message,
+          };
+        }
+      }
+    }
+
     const checkoutUrl =
-      r?.data?.data?.url ||
       r?.data?.data?.checkout?.url ||
       r?.data?.data?.checkout_url ||
-      r?.data?.checkout?.url ||
-      r?.data?.url ||
+      r?.data?.data?.url ||
+      r?.data?.data?.redirect_url ||
       null;
 
- >= 200 && r.status < 300 && checkoutUrl) {
-      return res.json({
-        url: checkoutUrl,
-        requestId,
-        used: { endpoint, apiBase },
-      });
+    if (r && r.status >= 200 && r.status < 300 && checkoutUrl) {
+      return res.json({ url: checkoutUrl, requestId });
     }
 
-    // Paddle sometimes returns 404 with code "invalid_url" if success/cancel URLs are not allowed.
-    const errCode = r?.data?.error?.code || r?.data?.error?.type || r?.data?.code;
-    if (r.status === 404 && String(errCode || "").toLowerCase().includes("invalid_url")) {
+    console.error("create-checkout error", { requestId, lastError, sent });
+    const errCode = lastError?.code || lastError?.response?.error?.code;
+    if (errCode === 'transaction_checkout_not_enabled') {
       return res.status(400).json({
-        error: "paddle_invalid_url",
-        message:
-          "Paddle rejected the success/cancel URL (invalid_url). Ensure the URLs are https, contain no '#', and are allowed/whitelisted in your Paddle dashboard settings.",
+        error: 'Paddle checkout not enabled',
+        hint: 'Enable Transaction Checkout / set Default payment link in Paddle Dashboard > Checkout settings, then retry.',
         requestId,
-        sent: { successUrl, cancelUrl },
-        paddle: { status: r.status, error: r.data?.error || r.data },
+        lastError,
+        sent,
       });
     }
+    const paddleStatus = lastError?.status;
+    const paddleCode = lastError?.code;
 
-    // Generic error
-    console.error("create-checkout error", {
-      requestId,
-      lastError: {
-        endpoint,
-        status: r.status,
-        code: errCode,
-        response: r?.data,
-      },
-      sent: {
-        plan,
-        priceId,
-        successUrl,
-        cancelUrl,
-      },
-    });
+    // If Paddle returns 4xx, it's usually a configuration / bad request problem.
+    const httpStatus = (paddleStatus && paddleStatus >= 400 && paddleStatus < 600) ? paddleStatus : 502;
 
-    return res.status(502).json({
-      error: "create_checkout_failed",
-      message: "Failed to create checkout session",
+    let userMessage = 'Paddle create-checkout failed';
+    if (paddleCode === 'transaction_checkout_not_enabled') {
+      userMessage = 'Paddle Transaction Checkout is not enabled for this account.';
+    } else if (paddleCode === 'invalid_url') {
+      userMessage = 'Paddle rejected the success/cancel URL.';
+    }
+
+    return res.status(httpStatus).json({
+      error: 'create-checkout failed',
+      message: userMessage,
       requestId,
-      details: {
-        endpoint,
-        status: r.status,
-        code: errCode,
-        // keep response small but useful
-        paddleError: r?.data?.error || null,
-      },
+      lastError,
+      hint,
+      sent,
     });
-  } catch (err) {
-    const requestId = crypto.randomUUID();
-    console.error("create-checkout exception", { requestId, message: err?.message, stack: err?.stack });
-    return res.status(502).json({ error: "create_checkout_failed", requestId, message: err?.message || String(err) });
+  } catch (e) {
+    console.error("create-checkout fatal", { requestId, message: e?.message, stack: e?.stack });
+    return res.status(500).json({ error: "Server error", requestId });
   }
 });
 
