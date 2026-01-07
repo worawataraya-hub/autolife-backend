@@ -1436,6 +1436,7 @@ app.get("/api/usage", authRequired, hydrateUserPlan, async (req, res) => {
 
 app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
   const requestId = req.headers["x-request-id"] || crypto.randomUUID();
+  let hint = null;
 
   try {
     const plan = String(req.body?.plan || "").toLowerCase();
@@ -1493,6 +1494,16 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
         custom_data: { user: userEmail, plan },
         checkout: { success_url: successUrl, cancel_url: cancelUrl },
       };
+
+  // Checkout Sessions API uses success_url/cancel_url at top-level (not nested under "checkout")
+  const payloadCheckoutSessions = {
+    items: payload.items,
+    customer: payload.customer,
+    custom_data: payload.custom_data,
+    success_url: successUrl,
+    cancel_url: cancelUrl,
+  };
+
       return axios.post(`${apiBase}/transactions`, payload, { headers, timeout: 20000 });
     };
 
@@ -1504,7 +1515,7 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
         cancel_url: cancelUrl,
         custom_data: { user: userEmail, plan },
       };
-      return axios.post(`${apiBase}/checkouts/sessions`, payload, { headers, timeout: 20000 });
+      return axios.post(`${apiBase}/checkout/sessions`, payload, { headers, timeout: 20000 });
     };
 
     let r;
@@ -1529,7 +1540,7 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
           lastError = null;
         } catch (e2) {
           lastError = {
-            endpoint: "/checkouts/sessions",
+            endpoint: "/checkout/sessions",
             status: e2?.response?.status,
             code: e2?.response?.data?.error?.code,
             response: e2?.response?.data,
@@ -1546,7 +1557,7 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
       r?.data?.data?.redirect_url ||
       null;
 
-    if (r && r.status >= 200 && r.status < 300 && checkoutUrl) {
+    if (r && (r.status >= 200 && r.status < 300) && checkoutUrl) {
       return res.json({ url: checkoutUrl, requestId });
     }
 
