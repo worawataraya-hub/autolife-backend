@@ -1495,21 +1495,13 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
 
     // Paddle Billing (API v2) — best effort:
     // Prefer /transactions (modern) which returns checkout.url
-    const endpoint = "/transactions";
+    const endpoint = '/checkouts/sessions';
 
     const payload = {
       items: [{ price_id: priceId, quantity: 1 }],
-      customer: { email: req.user?.email || undefined },
-      checkout: {
-        success_url: successUrl,
-        cancel_url: cancelUrl,
-      },
-      // helpful metadata for debugging / customer support
-      custom_data: {
-        plan,
-        user_id: req.user?.id || null,
-        email: req.user?.email || null,
-      },
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      ...(userEmail ? { customer: { email: userEmail } } : {}),
     };
 
     const requestId = crypto.randomUUID();
@@ -1522,13 +1514,14 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
 
     // Success path
     const checkoutUrl =
+      r?.data?.data?.url ||
       r?.data?.data?.checkout?.url ||
       r?.data?.data?.checkout_url ||
       r?.data?.checkout?.url ||
       r?.data?.url ||
       null;
 
-    if (r.status >= 200 && r.status < 300 && checkoutUrl) {
+ >= 200 && r.status < 300 && checkoutUrl) {
       return res.json({
         url: checkoutUrl,
         requestId,
