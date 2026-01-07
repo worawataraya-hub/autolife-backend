@@ -1479,8 +1479,17 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
     const customerEmail = req.user?.email || req.body?.email || null;
 
     const apiBase = paddleApiBase();
+
+    // IMPORTANT: Render UI can insert newlines when pasting secrets.
+    // Sanitize to ensure header contains no invalid characters.
+    const paddleKeyRaw = cleanHeaderValue(process.env.PADDLE_API_KEY || "");
+    const paddleKey = paddleKeyRaw.replace(/^Bearer\s+/i, "").replace(/\s+/g, "");
+    if (!paddleKey) {
+      throw new Error("Missing PADDLE_API_KEY (empty after sanitization)");
+    }
+
     const headers = {
-      Authorization: `Bearer ${process.env.PADDLE_API_KEY}`,
+      Authorization: `Bearer ${paddleKey}`,
       "Content-Type": "application/json",
     };
 
