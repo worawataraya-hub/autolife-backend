@@ -1491,30 +1491,47 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
     const endpoints = ["/transactions", "/checkout/sessions", "/checkouts/sessions"];
 
     const buildPayload = (endpoint) => {
-      // Paddle Billing API v2 (recommended): POST /transactions
-      if (endpoint === "/transactions") {
-        const payload = {
-          items: [{ price_id: priceId, quantity: 1 }],
-          checkout: { success_url: successUrl, cancel_url: cancelUrl },
-          custom_data: { plan: planKey, user: customerEmail || undefined, requestId },
-          metadata: { plan: planKey, user: customerEmail || undefined, requestId },
-        };
-        if (customerEmail) payload.customer = { email: customerEmail };
-        return payload;
-      }
-
-      // Legacy fallback payloads (kept so older vendor accounts still work)
-      return {
+    // Paddle Billing (Transactions API)
+    if (endpoint === "/transactions") {
+      const payload = {
         items: [{ price_id: priceId, quantity: 1 }],
-        customer_email: customerEmail || undefined,
-        success_url: successUrl,
-        cancel_url: cancelUrl,
-        custom_data: { plan: planKey, user: customerEmail || undefined, requestId },
-        metadata: { plan: planKey, user: customerEmail || undefined, requestId },
+        customer: email ? { email } : undefined,
+        checkout: {
+          success_url: CHECKOUT_SUCCESS_URL,
+          cancel_url: CHECKOUT_CANCEL_URL,
+        },
+        // keep context for webhook / plan mapping
+        custom_data: {
+          user: email,
+          plan: plan || (priceId === BASIC_PRICE_ID ? "basic" : "pro"),
+          priceId,
+          requestId,
+          source: "create-checkout",
+        },
       };
-    };
+      Object.keys(payload).forEach((k) => payload[k] === undefined && delete payload[k]);
+      return payload;
+    }
 
-    const extractCheckoutUrl = (data) =>
+    // Fallback: Checkout Sessions endpoints (if enabled on the account)
+    const payload = {
+      items: [{ price_id: priceId, quantity: 1 }],
+      customer: email ? { email } : undefined,
+      checkout: {
+        success_url: CHECKOUT_SUCCESS_URL,
+        cancel_url: CHECKOUT_CANCEL_URL,
+      },
+      custom_data: {
+        user: email,
+        plan: plan || (priceId === BASIC_PRICE_ID ? "basic" : "pro"),
+        priceId,
+        requestId,
+        source: "create-checkout",
+      },
+    };
+    Object.keys(payload).forEach((k) => payload[k] === undefined && delete payload[k]);
+    return payload;
+  };const extractCheckoutUrl = (data) =>
       data?.data?.checkout?.url ||
       data?.data?.url ||
       data?.data?.checkout_url ||
@@ -1548,9 +1565,9 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
           continue;
         }
 
-        // If Paddle says "invalid_url" (often 404) -> try next candidate
+        // If Paddle says "invalid_url" / "transaction_checkout_not_enabled" (often 404/400) -> try next candidate
         const code = resp.data?.error?.code || resp.data?.error?.type || resp.data?.code;
-        if (resp.status === 404 || code === "invalid_url") {
+        if (resp.status === 404 || code === "invalid_url" || code === "transaction_checkout_not_enabled") {
           lastError = { endpoint, status: resp.status, code, response: resp.data };
           continue;
         }
@@ -1572,7 +1589,18 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
     }
 
     console.error("create-checkout error", { requestId, lastError });
+    if (lastError?.code === "transaction_checkout_not_enabled") {
+      return res.status(400).json({
+        error: "transaction_checkout_not_enabled",
+        message:
+          "Your Paddle account/API key can call the API, but Transaction Checkout is not enabled for this vendor/project. Enable Checkout for Transactions in Paddle, or use a prebuilt checkout link flow.",
+        requestId,
+        lastError,
+      });
+    }
+
     return res.status(502).json({ error: "paddle_seen_as_unavailable", requestId, lastError });
+
   } catch (err) {
     console.error("create-checkout fatal", { requestId, message: err?.message, stack: err?.stack });
     return res.status(500).json({ error: "create_checkout_failed", requestId });
