@@ -1484,14 +1484,11 @@ app.post("/api/paddle/create-checkout", requireAuth, async (req, res) => {
     // -----------------------------
     // Paddle config
     // -----------------------------
-    const apiKey = process.env.PADDLE_API_KEY;
+    const apiKeyRaw = process.env.PADDLE_API_KEY || process.env.PADDLE_BILLING_API_KEY || process.env.PADDLE_SECRET_KEY || "";
+    const apiKey = cleanHeaderValue(apiKeyRaw);
     if (!apiKey) {
-      return res.status(500).json({
-        error: "Missing PADDLE_API_KEY",
-        requestId,
-      });
+      return res.status(500).json({ error: "server_misconfigured", message: "Missing PADDLE_API_KEY (Paddle Billing API key) in backend environment." });
     }
-
     // PADDLE_ENV can be: "sandbox", "production", "live", "prod" etc.
     const envRaw = String(process.env.PADDLE_ENV || "").toLowerCase().trim();
     const isSandbox = envRaw.includes("sand");
