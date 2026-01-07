@@ -1419,15 +1419,40 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
   try {
     const planKey = String(req.body?.plan || req.body?.planKey || "").toLowerCase().trim();
 
-    const priceId =
-      planKey === "basic"
-        ? process.env.PADDLE_PRICE_BASIC
-        : planKey === "pro"
-        ? process.env.PADDLE_PRICE_PRO
-        : null;
+    const resolvePriceId = (k) => {
+      if (k === "basic") {
+        return (
+          process.env.PADDLE_BASIC_PRICE_ID ||
+          process.env.PADDLE_PRICE_BASIC ||
+          process.env.PADDLE_BASIC_PRICE ||
+          ""
+        );
+      }
+      if (k === "pro") {
+        return (
+          process.env.PADDLE_PRO_PRICE_ID ||
+          process.env.PADDLE_PRICE_PRO ||
+          process.env.PADDLE_PRO_PRICE ||
+          ""
+        );
+      }
+      return "";
+    };
+
+    const priceId = resolvePriceId(planKey);
 
     if (!priceId) {
-      return res.status(400).json({ error: "invalid_plan", requestId, plan: planKey });
+      return res.status(400).json({
+        error: "missing_price_id",
+        plan: planKey,
+        requestId,
+        expectedEnv:
+          planKey === "basic"
+            ? ["PADDLE_BASIC_PRICE_ID", "PADDLE_PRICE_BASIC", "PADDLE_BASIC_PRICE"]
+            : planKey === "pro"
+            ? ["PADDLE_PRO_PRICE_ID", "PADDLE_PRICE_PRO", "PADDLE_PRO_PRICE"]
+            : [],
+      });
     }
 
     const base = paddleApiBase();
