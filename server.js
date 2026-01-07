@@ -112,9 +112,15 @@ const CHECKOUT_SUCCESS_URL = process.env.CHECKOUT_SUCCESS_URL;
 const CHECKOUT_CANCEL_URL = process.env.CHECKOUT_CANCEL_URL;
 // ---------- Helpers ----------
 function cleanHeaderValue(v) {
-  let s = String(v ?? "").replace(/[\r\n]+/g, "").trim();
-  // Allow env to be either raw token or "Bearer <token>"
-  if (/^Bearer\s+/i.test(s)) s = s.replace(/^Bearer\s+/i, "");
+  // Remove all control characters and whitespace that can break Node's HTTP header validation.
+  // (Render env vars sometimes include trailing newlines when pasted.)
+  let s = String(v ?? "");
+  // Strip "Bearer " if the user pasted a full auth header into the env var.
+  s = s.replace(/^Bearer\s+/i, "");
+  // Remove ASCII control chars + DEL
+  s = s.replace(/[\u0000-\u001F\u007F]/g, "");
+  // Remove all whitespace (keys shouldn't contain spaces/tabs/newlines)
+  s = s.replace(/\s+/g, "");
   return s;
 }
 
@@ -1291,16 +1297,21 @@ const PRICE_TO_PLAN = {
 
 function paddleApiBase() {
   const explicit = (process.env.PADDLE_API_BASE || "").trim();
-  if (explicit) return explicit.replace(/\/+$/, "");
+  if (explicit) return explicit;
 
-  const env = (process.env.PADDLE_ENV || process.env.PADDLE_MODE || "").toLowerCase().trim();
-  const isLive =
-    env === "live" ||
-    env === "prod" ||
-    env === "production" ||
-    env === "real";
+  const env = (process.env.PADDLE_ENV || "sandbox").toLowerCase();
+  const keyRaw = process.env.PADDLE_API_KEY || "";
+  const key = cleanHeaderValue(keyRaw).toLowerCase();
 
-  return isLive ? "https://api.paddle.com" : "https://sandbox-api.paddle.com";
+  // Heuristic: if the key clearly looks like a live key, prefer production;
+  // if it looks like a test/sandbox key, prefer sandbox.
+  const looksLive = key.includes("_live_") || key.startsWith("pdl_live") || key.startsWith("pdI_live") || key.startsWith("pdi_live");
+  const looksSandbox = key.includes("_test_") || key.includes("_sandbox_") || key.startsWith("pdl_test") || key.startsWith("pdl_sandbox") || key.startsWith("pdi_test");
+
+  if (looksLive) return "https://api.paddle.com";
+  if (looksSandbox) return "https://sandbox-api.paddle.com";
+
+  return env === "production" ? "https://api.paddle.com" : "https://sandbox-api.paddle.com";
 }
 
 
