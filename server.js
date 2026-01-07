@@ -1469,9 +1469,12 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
 
     const customerEmail = req.user?.email || req.body?.email || null;
 
+    const paddleApiKeyRaw = cleanHeaderValue(process.env.PADDLE_API_KEY);
+    const paddleApiKey = paddleApiKeyRaw.replace(/^Bearer\s+/i, "");
     const headers = {
-      Authorization: `Bearer ${process.env.PADDLE_API_KEY}`,
+      Authorization: `Bearer ${paddleApiKey}`,
       "Content-Type": "application/json",
+      Accept: "application/json",
     };
 
     const endpoints = ["/transactions", "/checkout/sessions", "/checkouts/sessions"];
