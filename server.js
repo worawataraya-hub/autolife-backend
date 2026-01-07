@@ -103,10 +103,10 @@ const JWT_SECRET = process.env.JWT_SECRET || "change-me";
 
 const PADDLE_ENV = (process.env.PADDLE_ENV || "sandbox").toLowerCase(); // sandbox | live
 const PADDLE_API_KEY = (process.env.PADDLE_API_KEY || "").trim();
-const PADDLE_WEBHOOK_SECRET = (process.env.PADDLE_WEBHOOK_SECRET || \"\").trim();
+const PADDLE_WEBHOOK_SECRET = (process.env.PADDLE_WEBHOOK_SECRET || "").trim();
 
-const PADDLE_BASIC_PRICE_ID = (process.env.PADDLE_BASIC_PRICE_ID || \"\").trim();
-const PADDLE_PRO_PRICE_ID = (process.env.PADDLE_PRO_PRICE_ID || \"\").trim();
+const PADDLE_BASIC_PRICE_ID = (process.env.PADDLE_BASIC_PRICE_ID || "").trim();
+const PADDLE_PRO_PRICE_ID = (process.env.PADDLE_PRO_PRICE_ID || "").trim();
 
 const CHECKOUT_SUCCESS_URL = process.env.CHECKOUT_SUCCESS_URL;
 const CHECKOUT_CANCEL_URL = process.env.CHECKOUT_CANCEL_URL;
@@ -1555,7 +1555,7 @@ const extractCheckoutUrl = (data) =>
         if (resp.status >= 200 && resp.status < 300) {
           const checkoutUrl = extractCheckoutUrl(resp.data);
           if (checkoutUrl) {
-            return res.json({ url: normalizeCheckoutUrl(checkoutUrl), requestId });
+            return res.json({ url: normalizeCheckoutUrlForPaddle(checkoutUrl), requestId });
           }
           lastError = {
             endpoint,
