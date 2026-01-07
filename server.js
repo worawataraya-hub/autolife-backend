@@ -461,10 +461,13 @@ function authRequired(req, res, next) {
   } catch (e) {
     return res.status(401).json({ error: "unauthorized", message: "Token ไม่ถูกต้อง/หมดอายุ" });
   }
-const requireAuth = authRequired; // alias (older route code uses requireAuth)
 }
 
+// alias (older route code uses requireAuth)
+const requireAuth = authRequired;
+
 // Always read latest plan from DB so webhook upgrades apply immediately
+
 async function hydrateUserPlan(req, res, next) {
   try {
     const email = String(req.user?.email || "").toLowerCase();
