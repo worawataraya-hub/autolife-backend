@@ -461,6 +461,7 @@ function authRequired(req, res, next) {
   } catch (e) {
     return res.status(401).json({ error: "unauthorized", message: "Token ไม่ถูกต้อง/หมดอายุ" });
   }
+const requireAuth = authRequired; // alias (older route code uses requireAuth)
 }
 
 // Always read latest plan from DB so webhook upgrades apply immediately
@@ -1500,8 +1501,8 @@ app.post("/api/paddle/create-checkout", requireAuth, async (req, res) => {
       process.env.PADDLE_API_BASE_URL ||
       (isSandbox ? "https://sandbox-api.paddle.com" : "https://api.paddle.com");
 
-    const successUrl = `${FRONTEND_URL.replace(/\/$/, "")}/checkout-success`;
-    const cancelUrl = `${FRONTEND_URL.replace(/\/$/, "")}/pricing`;
+    const successUrl = normalizeCheckoutUrlForPaddle(sanitizeRedirectUrl(process.env.CHECKOUT_SUCCESS_URL || "https://autolife-ai.netlify.app/checkout-success"));
+    const cancelUrl  = normalizeCheckoutUrlForPaddle(sanitizeRedirectUrl(process.env.CHECKOUT_CANCEL_URL  || "https://autolife-ai.netlify.app/pricing"));
 
     // -----------------------------
     // Create transaction (recommended)
