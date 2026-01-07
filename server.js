@@ -102,11 +102,11 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const JWT_SECRET = process.env.JWT_SECRET || "change-me";
 
 const PADDLE_ENV = (process.env.PADDLE_ENV || "sandbox").toLowerCase(); // sandbox | live
-const PADDLE_API_KEY = process.env.PADDLE_API_KEY;
-const PADDLE_WEBHOOK_SECRET = process.env.PADDLE_WEBHOOK_SECRET;
+const PADDLE_API_KEY = (process.env.PADDLE_API_KEY || "").trim();
+const PADDLE_WEBHOOK_SECRET = (process.env.PADDLE_WEBHOOK_SECRET || \"\").trim();
 
-const PADDLE_BASIC_PRICE_ID = process.env.PADDLE_BASIC_PRICE_ID;
-const PADDLE_PRO_PRICE_ID = process.env.PADDLE_PRO_PRICE_ID;
+const PADDLE_BASIC_PRICE_ID = (process.env.PADDLE_BASIC_PRICE_ID || \"\").trim();
+const PADDLE_PRO_PRICE_ID = (process.env.PADDLE_PRO_PRICE_ID || \"\").trim();
 
 const CHECKOUT_SUCCESS_URL = process.env.CHECKOUT_SUCCESS_URL;
 const CHECKOUT_CANCEL_URL = process.env.CHECKOUT_CANCEL_URL;
@@ -1490,7 +1490,7 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
 
     const endpoints = ["/transactions", "/checkout/sessions", "/checkouts/sessions"];
 
-      const buildPayload = (endpoint) => {
+    const buildPayload = (endpoint) => {
     // Paddle Billing v2:
     // - /transactions expects "checkout" object
     // - /checkout(s)/sessions expects top-level success_url / cancel_url
@@ -1498,14 +1498,14 @@ app.post("/api/paddle/create-checkout", authRequired, async (req, res) => {
 
     const common = {
       custom_data: {
-        planTarget,
-        userEmail: userEmail || null,
+        planTarget: planKey,
+        userEmail: customerEmail || null,
         requestId,
         source: "pricing_modal",
       },
       metadata: {
-        planTarget,
-        userEmail: userEmail || null,
+        planTarget: planKey,
+        userEmail: customerEmail || null,
         requestId,
       },
     };
