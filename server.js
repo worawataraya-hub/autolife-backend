@@ -1120,82 +1120,83 @@ Rules:
     let { text: aiText, modelUsed, apiVersion } = await runOnce(finalPrompt);
     let finalText = aiText;
 
+    const normalizeTrendsPayload = (obj) => {
+      // Goal: always return { trends: [ {title, hook, reason, idea, prompt} x10 ] }
+      const safeStr = (v) => (v == null ? "" : String(v)).trim();
+      const coerceTrend = (t, i) => {
+        const title = safeStr(t?.title || t?.trend || t?.name || `Trending #${i + 1}`);
+        return {
+          title,
+          hook: safeStr(t?.hook || t?.theHook || t?.Hook || ""),
+          reason: safeStr(t?.reason || t?.why || t?.whyViral || t?.whyItsViral || ""),
+          idea: safeStr(t?.idea || t?.contentIdea || ""),
+          prompt: safeStr(t?.prompt || t?.videoPrompt || ""),
+        };
+      };
+
+      const trends = Array.isArray(obj?.trends)
+        ? obj.trends
+        : (Array.isArray(obj?.items) ? obj.items : (Array.isArray(obj) ? obj : []));
+
+      const out = [];
+      for (let i = 0; i < 10; i++) {
+        const src = trends[i] || {};
+        out.push(coerceTrend(src, i));
+      }
+      return { trends: out };
+    };
+
+    const looksLikeTrends = (obj) => Array.isArray(obj?.trends) && obj.trends.length >= 5;
+
     if (wantsJson) {
       // Try parse JSON response; if parsing fails, still return raw text.
+      let parsed = null;
       try {
-        const json = JSON.parse(finalText);
+        parsed = JSON.parse(finalText);
+      } catch (e) {
+        parsed = null;
+      }
+
+      // If Viral Finder asked for trends, enforce a stable schema.
+      if (wantsTrends) {
+        if (!looksLikeTrends(parsed)) {
+          // Repair attempt (one extra model call) using the original output as context.
+          const repairPrompt = [
+            VIRAL_STRICT_JSON_PREFIX,
+            "\n\nYour previous output did NOT match the required schema.",
+            "Fix it NOW. Output ONLY valid JSON that matches the schema exactly.",
+            "Do not add extra keys.",
+            "\n\nORIGINAL_USER_REQUEST:\n" + promptText,
+            "\n\nBAD_OUTPUT:\n" + String(finalText).slice(0, 8000)
+          ].join("\n");
+          try {
+            const repaired = await runOnce(repairPrompt);
+            parsed = JSON.parse(String(repaired?.text || ""));
+          } catch (_) {
+            // keep parsed as-is
+          }
+        }
+
+        // normalize even if model gave partial keys
+        const json = normalizeTrendsPayload(parsed || {});
         const usage = await bumpUsage(req.user.id);
         return res.json({ ok: true, json, requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
-      } catch (e) {
-        const usage = await bumpUsage(req.user.id);
-        return res.json({ ok: true, text: finalText, requestId, json_parse_error: String(e && e.message ? e.message : e) , plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
       }
+
+      if (parsed) {
+        const usage = await bumpUsage(req.user.id);
+        return res.json({ ok: true, json: parsed, requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+      }
+      const usage = await bumpUsage(req.user.id);
+      return res.json({ ok: true, text: finalText, requestId, json_parse_error: "invalid_json", plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
     }
 
-    const hookPrompt = [
-      "You are a video editor assistant.",
-      "Given a short transcript, estimate the best hook segment for a short-form video.",
-      "Return ONLY valid JSON with keys: hookStart (number, seconds), hookDuration (number, seconds), rationale (string).",
-      "Rules:",
-      "- hookStart must be >= 0",
-      "- hookDuration between 2 and 6",
-      "- Keep rationale short.",
-      "",
-      `Language hint: ${language}`,
-      "",
-      "Transcript:",
-      safeTranscript
-    ].join("\n");
-
-    // Ask Gemini for strict JSON
-    const out = await callGeminiGenerateContent({
-      prompt: hookPrompt.join("\n"),
-      temperature: 0.3,
-      maxOutputTokens: 256,
-      responseMimeType: "application/json",
-    });
-
-    let jsonText = (out && out.text) ? String(out.text) : "";
-    // Gemini sometimes wraps JSON in code fences
-    jsonText = jsonText.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
-
-    let parsed;
-    try {
-      parsed = JSON.parse(jsonText);
-    } catch (e) {
-      // fallback - try to extract first JSON object
-      const match = jsonText.match(/\{[\s\S]*\}/);
-      parsed = match ? JSON.parse(match[0]) : null;
-    }
-
-    // count usage once per request (even if output is invalid)
+    // Plain text response
     const usage = await bumpUsage(req.user.id);
-
-    if (!parsed || typeof parsed !== "object") {
-      return res.json({
-        plan: String(req.user.plan || "free").toLowerCase(),
-        usage,
-        usageSummary: usageSummary(req.user.plan, usage),
-        hookStart: 0,
-        hookDuration: 3,
-        rationale: "Fallback (invalid model output)"
-      });
-    }
-
-    const hookStart = Number(parsed.hookStart);
-    const hookDuration = Number(parsed.hookDuration);
-
-    return res.json({
-      plan: String(req.user.plan||"free").toLowerCase(),
-      usage,
-      usageSummary: usageSummary(req.user.plan, usage),
-      hookStart: Number.isFinite(hookStart) ? Math.max(0, hookStart) : 0,
-      hookDuration: Number.isFinite(hookDuration) ? Math.min(6, Math.max(2, hookDuration)) : 3,
-      rationale: String(parsed.rationale || "")
-    });
+    return res.json({ ok: true, text: finalText, requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
   } catch (err) {
-    console.error("geminiHook error:", err);
-    return res.status(err.status || 500).json({ error: err.message || "geminiHook failed" });
+    console.error("/api/gemini-text error:", err);
+    return res.status(err.status || 500).json({ ok: false, error: err.message || "gemini-text failed" });
   }
 });
 
@@ -1529,18 +1530,32 @@ app.post("/api/paddle/create-checkout", requireAuth, async (req, res) => {
 
       // Helpful hints for common Paddle setup issues
       let hint = null;
+      let actionRequired = null;
+      let httpStatus = 502;
       if (code === "transaction_checkout_not_enabled") {
+        // This is a Paddle-account setting/permission issue (not a bug in our code).
+        // Return 409 so FE can show a clear 'action required' message.
+        httpStatus = 409;
+        actionRequired = "enable_transaction_checkout";
         hint =
-          "Paddle says Transaction Checkout is not enabled for this account. In Paddle Billing settings, enable Transaction checkout / checkout URLs (or contact Paddle support).";
+          "Paddle ตอบกลับว่า Transaction Checkout ยังไม่ถูกเปิดใช้งาน (code: transaction_checkout_not_enabled). ให้ไปที่ Paddle Billing/Checkout แล้วเปิดใช้งาน Transaction checkout (หรือ Checkout links) — ถ้าไม่มีเมนูนี้/เปิดไม่ได้ ให้ติดต่อ Paddle Support เพื่อเปิดฟีเจอร์ให้บัญชี.";
       } else if (code === "invalid_url") {
         hint =
           "Paddle rejected the success/cancel URL. Double-check your successUrl/cancelUrl domains and that they are valid HTTPS URLs.";
+        httpStatus = 400;
       } else if (r.status === 401 || r.status === 403) {
         hint =
           "Paddle auth failed. Verify PADDLE_API_KEY and that you are using the correct environment (sandbox vs live).";
+        httpStatus = r.status;
       } else if (r.status === 404) {
         hint =
           "Paddle endpoint not found. Likely wrong API base URL for the environment. Use https://api.paddle.com (live) or https://sandbox-api.paddle.com (sandbox).";
+        httpStatus = 500;
+      }
+
+      // If Paddle returned a 4xx and we didn't override, pass it through so FE can show a meaningful error.
+      if (httpStatus === 502 && r.status >= 400 && r.status < 500) {
+        httpStatus = r.status;
       }
 
       console.error("create-checkout error", {
@@ -1555,12 +1570,13 @@ app.post("/api/paddle/create-checkout", requireAuth, async (req, res) => {
         sent: { plan: planKey, priceId, successUrl, cancelUrl, apiBase },
       });
 
-      return res.status(502).json({
+      return res.status(httpStatus).json({
         error: "paddle_create_checkout_failed",
         requestId,
         status: r.status,
         code,
         hint,
+        actionRequired,
         details: paddleError,
         sent: { plan: planKey, priceId, successUrl, cancelUrl },
       });
