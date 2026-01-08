@@ -1111,7 +1111,7 @@ Rules:
     const runOnce = async (p) => {
       return await callGeminiGenerateContent({
         prompt: p,
-        useSearch: wantsTrends ? true : !!useSearch,
+        useSearch: wantsTrends ? false : !!useSearch,
         responseMimeType: effectiveMime,
         temperature: (typeof temperature === "number" ? temperature : (wantsJson ? 0.4 : 0.6)),
         maxOutputTokens: 2048,
