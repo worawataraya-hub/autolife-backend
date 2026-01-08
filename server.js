@@ -1101,6 +1101,7 @@ Rules:
 - Each title MUST be a distinct TikTok trend/topic for the requested category. Avoid duplicates.
 - tiktokUrl MUST be a valid-looking TikTok URL (https://www.tiktok.com/...) relevant to the title. If you are unsure, still provide a plausible TikTok search URL format.
 - Keep hook/reason/idea/prompt concise (1-2 lines each).
+- Language: Write MOSTLY in Thai. You may include some English terms when natural (e.g., product names, hashtags, prompt keywords).
 `;
 
     const finalPrompt = wantsTrends
