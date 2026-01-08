@@ -1180,12 +1180,12 @@ Rules:
         // normalize even if model gave partial keys
         const json = normalizeTrendsPayload(parsed || {});
         const usage = await bumpUsage(req.user.id);
-        return res.json({ ok: true, json, requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+        return res.json({ ok: true, json, text: JSON.stringify(json), requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
       }
 
       if (parsed) {
         const usage = await bumpUsage(req.user.id);
-        return res.json({ ok: true, json: parsed, requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+        return res.json({ ok: true, json: parsed, text: JSON.stringify(parsed), requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
       }
       const usage = await bumpUsage(req.user.id);
       return res.json({ ok: true, text: finalText, requestId, json_parse_error: "invalid_json", plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
