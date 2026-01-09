@@ -827,8 +827,14 @@ function pickFirst(obj, keys) {
 }
 
 function normalizeTrendItem(raw, idx) {
+  // Models sometimes return arrays of strings like:
+  //   { trends: ["เทรนด์ A", "เทรนด์ B", ...] }
+  // Support that by treating string items as the title.
+  const isStringItem = typeof raw === "string";
   const r = raw && typeof raw === "object" ? raw : {};
-  const title = String(pickFirst(r, ["title", "trend", "topic", "headline", "name"]) || `Trending #${idx + 1}`).trim();
+  const title = String(
+    (isStringItem ? raw : pickFirst(r, ["title", "trend", "topic", "headline", "name"])) || `Trending #${idx + 1}`
+  ).trim();
   const tiktokUrl = String(pickFirst(r, ["tiktokUrl", "url", "link", "tiktok", "openTikTokUrl"]) || "").trim();
   const hook = String(pickFirst(r, ["hook", "theHook", "hook_th", "hook_thai"]) || "").trim();
   const whyViral = String(pickFirst(r, ["why_viral", "whyViral", "analysis", "reason", "why", "whyItsViral"]) || "").trim();
@@ -864,7 +870,11 @@ function normalizeTrendsPayload(parsed) {
 
   const dig = (obj, depth = 0) => {
     if (!obj || typeof obj !== "object" || depth > 2) return null;
-    const directKeys = ["trends", "items", "results", "data", "top10", "topTrends", "trending", "topics", "trendList", "list"];
+    const directKeys = [
+      "trends", "items", "results", "data", "top10", "topTrends", "trending", "topics", "trendList", "list",
+      // common alternates
+      "trend_titles", "trendTitles", "trend_names", "trendNames", "trends_1_10", "trends1to10"
+    ];
     for (const k of directKeys) {
       if (Object.prototype.hasOwnProperty.call(obj, k)) {
         const got = asListFromMaybe(obj[k]);
@@ -1088,9 +1098,9 @@ Schema (MUST follow exactly):
       "rank": 1,
       "title": string,
       "hook": string,
-      "reason": string,
-      "idea": string,
-      "prompt": string,
+      "why_viral": string,
+      "contentIdea": string,
+      "imagePrompt": string,
       "tiktokUrl": string
     }
   ]
@@ -1100,7 +1110,7 @@ Rules:
 - "trends" MUST be an array with EXACTLY 10 items (rank 1..10). No fewer, no more.
 - Each title MUST be a distinct TikTok trend/topic for the requested category. Avoid duplicates.
 - tiktokUrl MUST be a valid-looking TikTok URL (https://www.tiktok.com/...) relevant to the title. If you are unsure, still provide a plausible TikTok search URL format.
-- Keep hook/reason/idea/prompt concise (1-2 lines each).
+- Keep hook/why_viral/contentIdea/imagePrompt concise (1-2 lines each).
 - Language: Write MOSTLY in Thai. You may include some English terms when natural (e.g., product names, hashtags, prompt keywords).
 `;
 
@@ -1125,13 +1135,26 @@ Rules:
       // Goal: always return { trends: [ {title, hook, reason, idea, prompt} x10 ] }
       const safeStr = (v) => (v == null ? "" : String(v)).trim();
       const coerceTrend = (t, i) => {
-        const title = safeStr(t?.title || t?.trend || t?.name || `Trending #${i + 1}`);
+        // Model can return an object or a plain string title.
+        if (typeof t === "string") {
+          return {
+            title: safeStr(t) || `Trending #${i + 1}`,
+            hook: "",
+            why_viral: "",
+            contentIdea: "",
+            imagePrompt: "",
+            tiktokUrl: "",
+          };
+        }
+
+        const title = safeStr(t?.title || t?.trend || t?.name || t?.topic || t?.headline || `Trending #${i + 1}`);
         return {
           title,
           hook: safeStr(t?.hook || t?.theHook || t?.Hook || ""),
-          reason: safeStr(t?.reason || t?.why || t?.whyViral || t?.whyItsViral || ""),
-          idea: safeStr(t?.idea || t?.contentIdea || ""),
-          prompt: safeStr(t?.prompt || t?.videoPrompt || ""),
+          why_viral: safeStr(t?.why_viral || t?.reason || t?.why || t?.whyViral || t?.whyItsViral || ""),
+          contentIdea: safeStr(t?.contentIdea || t?.idea || t?.content_idea || ""),
+          imagePrompt: safeStr(t?.imagePrompt || t?.prompt || t?.videoPrompt || t?.image_prompt || ""),
+          tiktokUrl: safeStr(t?.tiktokUrl || t?.url || t?.link || ""),
         };
       };
 
