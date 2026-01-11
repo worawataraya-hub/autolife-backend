@@ -1147,6 +1147,65 @@ async function fetchTikTokCreativeCenterHashtags({ countryCode = "TH" } = {}) {
   return seeds;
 }
 
+
+async function fetchTrendSeedsViaGeminiSearch({ categoryLabel = "Daily Hot", countryCode = "TH" } = {}) {
+  // Fallback: ask Gemini (with grounding/search) to list currently trending TikTok hashtags/topics.
+  // NOTE: TikTok has no official public global trending API; this is an AI+search assisted seed list.
+  const SEED_SCHEMA_PREFIX = `You are a JSON API. Return ONLY valid JSON. No markdown, no commentary.
+
+Schema:
+{
+  "tags": [ string ]
+}
+
+Rules:
+- Return 20-30 items in "tags".
+- Each item must be a Thai TikTok trend hashtag or short topic phrase for the LAST 24-72 hours.
+- Prefer Thailand if countryCode=TH.
+- Use concise strings. Hashtags can include leading "#".
+- No placeholders like "Trending #1".
+- Output MUST be valid JSON parsable by JSON.parse().
+`;
+
+  const prompt = [
+    SEED_SCHEMA_PREFIX,
+    `countryCode: ${countryCode}`,
+    `category: ${categoryLabel}`,
+    "Task: List the most currently trending TikTok hashtags/topics for this category and country."
+  ].join("\n");
+
+  try {
+    const { text } = await callGeminiGenerateContent({
+      prompt,
+      useSearch: true,
+      responseMimeType: "application/json",
+      temperature: 0.2,
+      maxOutputTokens: 1024,
+    });
+    let parsed = null;
+    try { parsed = JSON.parse(String(text || "")); } catch (_) { parsed = null; }
+    const raw = Array.isArray(parsed?.tags) ? parsed.tags : [];
+    const cleaned = raw
+      .map((x) => String(x || "").trim())
+      .filter((x) => x && !/^Trending\s*#\d+/i.test(x) && x.length <= 60);
+    // Normalize to hashtag form (optional)
+    const uniq = [];
+    const seen = new Set();
+    for (const t of cleaned) {
+      const tag = t.startsWith("#") ? t : `#${t.replace(/^#+/, "")}`;
+      const key = tag.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniq.push(tag);
+      }
+      if (uniq.length >= 30) break;
+    }
+    return uniq;
+  } catch (_) {
+    return [];
+  }
+}
+
 function buildTikTokHashtagUrl(tag) {
   const clean = String(tag || "").replace(/^#/, "").trim();
   if (!clean) return "";
@@ -1262,6 +1321,16 @@ if (wantsTrends) {
     (viralCategory && String(viralCategory)) ||
     (meta && meta.categoryLabel) ||
     "Daily Hot";
+
+
+// If Creative Center scraping produced no seeds, use Gemini+search to get a better seed list.
+if (!Array.isArray(trendSeedHashtags) || trendSeedHashtags.length === 0) {
+  const viaGemini = await fetchTrendSeedsViaGeminiSearch({ categoryLabel, countryCode });
+  if (Array.isArray(viaGemini) && viaGemini.length) {
+    trendSeedHashtags = viaGemini.slice(0, 30);
+    trendSeedSource = "gemini_search";
+  }
+}
 
   // Rebuild the prompt for strict JSON trends output
     // Build a deterministic base list so the UI never falls back to "Trending #1" placeholders
