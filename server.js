@@ -1202,6 +1202,20 @@ function looksLikeTrendsPayload(obj) {
   return !!(obj && typeof obj === "object" && Array.isArray(obj.trends));
 }
 
+
+// Compatibility wrapper: older routes call `callGemini(...)`
+// but the implementation is `callGeminiGenerateContent(...)`.
+async function callGemini(arg, extra = {}) {
+  // Supports: callGemini({prompt, ...}) OR callGemini("prompt", {...})
+  if (typeof arg === 'string') {
+    return await callGeminiGenerateContent({ prompt: arg, ...extra });
+  }
+  if (arg && typeof arg === 'object') {
+    return await callGeminiGenerateContent(arg);
+  }
+  throw new Error('callGemini: invalid arguments');
+}
+
 app.post('/api/gemini-text', async (req, res) => {
   const requestId = crypto.randomUUID();
 
