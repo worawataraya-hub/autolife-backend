@@ -1213,48 +1213,14 @@ if (cacheKey) {
   if (cached) {
     res.setHeader("X-Cache", "HIT");
     const usage = await bumpUsage(req.user.id);
-    return res.json({ ...cached, requestId, trendSeedSource, trendSeedHashtags, cached: true, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+    return res.json({ ...cached, requestId, trendSeedSource: cached.trendSeedSource || "cache", trendSeedHashtags: cached.trendSeedHashtags || [], cached: true, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
   }
   res.setHeader("X-Cache", "MISS");
 }
-const wantsTrends =
-  !!(meta && (meta.wantsTrends || meta.forceTrends)) ||
-  !!(req.body && (req.body.wantsTrends || req.body.forceTrends)) ||
-  (typeof prompt === "string" && /"trends"\s*:\s*\[/.test(prompt));
 
-if (!prompt && !wantsTrends) {
-  return res.status(400).json({ error: "prompt_required" });
-}
+// wantsTrends detection is handled below after promptText/viralCategory are defined.
 
-
-// If Viral Finder trends are requested, seed with TikTok Creative Center hashtags (best-effort).
-let trendSeedSource = "none";
-let trendSeedHashtags = [];
-let categoryLabel = viralCategory || (meta && (meta.categoryLabel || meta.category)) || "Daily Hot";
-
-if (wantsTrends) {
-  try {
-    trendSeedHashtags = await fetchTikTokCreativeCenterHashtags({ countryCode: "TH" });
-    if (trendSeedHashtags && trendSeedHashtags.length) trendSeedSource = "creative_center";
-  } catch (e) {
-    trendSeedSource = "ai_only";
-    trendSeedHashtags = [];
-  }
-
-  // Build a robust prompt on the backend to avoid placeholder outputs.
-  promptText = buildViralFinderPrompt({
-    categoryLabel,
-    countryCode: "TH",
-    seeds: trendSeedHashtags
-  });
-}
-
-const mimeRequested = responseMimeType ? String(responseMimeType) : undefined;
-
-    // Viral Finder MUST be stable: always return exactly 10 trends.
-    // Even if the frontend forgets to request JSON, force JSON mode for Viral Finder.
-    // The frontend can also set explicit flags (forceTrends / viralCategory / category).
-    let promptText = String(prompt || "");
+let promptText = String(prompt || "");
     const forceTrends = !!req.body.forceTrends;
     const viralCategory = req.body.viralCategory || req.body.category || (meta && meta.viralCategory);
     const wantsTrends = (
@@ -1263,6 +1229,46 @@ const mimeRequested = responseMimeType ? String(responseMimeType) : undefined;
       (meta && typeof meta === "object" && meta.tool === "viral_finder_trends") ||
       /viral\s*f\w*nder|viral\s*finder|trending\s*1-?10|\"trends\"\s*:|\btrends\b/i.test(promptText)
     );
+
+// Validate prompt (allow empty when asking for trends only)
+if (!promptText && !wantsTrends) {
+  return res.status(400).json({ error: "prompt_required" });
+}
+
+// If caller wants TikTok trends, try to seed the prompt with real public trend keywords/hashtags.
+// NOTE: TikTok does not provide an official public global "top trending" API. We use Creative Center
+// (public page) as a lightweight seed source; AI then expands to "Trending 1-10" structure.
+let trendSeedSource = "none";
+let trendSeedHashtags = [];
+const countryCode = String((req.body && req.body.countryCode) || (meta && meta.countryCode) || "TH").toUpperCase();
+
+if (wantsTrends) {
+  try {
+    trendSeedHashtags = await fetchTikTokCreativeCenterHashtags({ countryCode });
+    if (Array.isArray(trendSeedHashtags) && trendSeedHashtags.length) {
+      trendSeedSource = "creative_center";
+    } else {
+      trendSeedSource = "ai_only";
+      trendSeedHashtags = [];
+    }
+  } catch (e) {
+    trendSeedSource = "ai_only";
+    trendSeedHashtags = [];
+  }
+
+  const categoryLabel =
+    (viralCategory && String(viralCategory)) ||
+    (meta && meta.categoryLabel) ||
+    "Daily Hot";
+
+  // Rebuild the prompt for strict JSON trends output
+  promptText = buildViralFinderPrompt({
+    categoryLabel,
+    countryCode,
+    seeds: trendSeedHashtags,
+  });
+}
+
 
     const effectiveMime = wantsTrends ? "application/json" : mimeRequested;
     const wantsJson = effectiveMime === "application/json";
