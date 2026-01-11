@@ -1108,13 +1108,15 @@ Schema (MUST follow exactly):
 
 Rules:
 - Return exactly 10 items in "trends" with ranks 1..10 (no gaps, no duplicates).
-- Every string field MUST be non-empty.
-- "title": 4–10 words, specific (no "Trending #1", no generic placeholders).
-- "hook": 1–2 sentences that could open a short TikTok (Thai allowed).
+- Use the MOST RECENT information you can (last 24–72 hours) for TikTok Thailand.
+- If web search/grounding is available, use it to identify REAL trending hashtags/topics for the selected category.
+- Every string field MUST be non-empty EXCEPT "tiktokUrl" (may be "" if unknown).
+- "title": 4–10 words, specific (no "Trending #1", no generic placeholders). Titles must be unique.
+- "hook": 1–2 Thai sentences that could open a short TikTok.
 - "why_viral": 2–4 bullet-style phrases in one string (use "• ").
-- "contentIdea": a clear mini-script / structure (Hook → Value → CTA).
+- "contentIdea": a clear mini-script / structure (Hook → Value → Proof → CTA).
 - "imagePrompt": a single detailed prompt for generating a thumbnail image, include style + subject + lighting.
-- "tiktokUrl": if you don't know a real URL, use "" (empty string) ONLY for this field.
+- "tiktokUrl": Prefer a TikTok SEARCH URL like https://www.tiktok.com/search?q=... if you don't know an exact video URL.
 
 Output MUST be valid JSON parsable by JSON.parse().
 `;
@@ -1126,7 +1128,7 @@ Output MUST be valid JSON parsable by JSON.parse().
     const runOnce = async (p) => {
       return await callGeminiGenerateContent({
         prompt: p,
-        useSearch: wantsTrends ? false : !!useSearch,
+        useSearch: wantsTrends ? (useSearch !== undefined ? !!useSearch : true) : !!useSearch,
         responseMimeType: effectiveMime,
         temperature: (typeof temperature === "number" ? temperature : (wantsJson ? 0.4 : 0.6)),
         maxOutputTokens: 2048,
@@ -1153,14 +1155,22 @@ Output MUST be valid JSON parsable by JSON.parse().
         }
 
         const title = safeStr(t?.title || t?.trend || t?.name || t?.topic || t?.headline || `Trending #${i + 1}`);
-        return {
-          title,
-          hook: safeStr(t?.hook || t?.theHook || t?.Hook || ""),
-          why_viral: safeStr(t?.why_viral || t?.reason || t?.why || t?.whyViral || t?.whyItsViral || ""),
-          contentIdea: safeStr(t?.contentIdea || t?.idea || t?.content_idea || ""),
-          imagePrompt: safeStr(t?.imagePrompt || t?.prompt || t?.videoPrompt || t?.image_prompt || ""),
-          tiktokUrl: safeStr(t?.tiktokUrl || t?.url || t?.link || ""),
-        };
+        const _title = title;
+          const _hook = safeStr(t?.hook || t?.theHook || t?.Hook || "") || `คนกำลังพูดถึง "${_title}" — เปิดคลิปด้วยประโยคสั้น ๆ ที่ทำให้หยุดดู`;
+          const _why = safeStr(t?.why_viral || t?.reason || t?.why || t?.whyViral || t?.whyItsViral || "") || `• เข้าใจง่าย
+• กระตุ้นให้คนคอมเมนต์/แชร์
+• มีมุม before-after หรือหลักฐาน`;
+          const _idea = safeStr(t?.contentIdea || t?.idea || t?.content_idea || "") || `Hook → บอกปัญหา/สิ่งที่คนสงสัย → ให้ทริค/หลักฐานสั้น ๆ → ปิดด้วยคำถาม/CTA`;
+          const _img = safeStr(t?.imagePrompt || t?.prompt || t?.videoPrompt || t?.image_prompt || "") || `Thai TikTok thumbnail, subject: ${_title}, clean bold typography, high contrast, cinematic lighting, shallow depth of field`;
+          const _url = safeStr(t?.tiktokUrl || t?.url || t?.link || "") || `https://www.tiktok.com/search?q=${encodeURIComponent(_title)}`;
+          return {
+            title: _title,
+            hook: _hook,
+            why_viral: _why,
+            contentIdea: _idea,
+            imagePrompt: _img,
+            tiktokUrl: _url,
+          };
       };
 
       const trends = Array.isArray(obj?.trends)
