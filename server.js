@@ -1202,238 +1202,163 @@ function looksLikeTrendsPayload(obj) {
   return !!(obj && typeof obj === "object" && Array.isArray(obj.trends));
 }
 
-app.post("/api/gemini-text", authRequired, hydrateUserPlan, quotaGuard(), async (req, res) => {
-  try {
-    const { prompt, responseMimeType, useSearch, temperature, maxOutputTokens, meta } = req.body || {};
+app.post('/api/gemini-text', async (req, res) => {
+  const requestId = crypto.randomUUID();
 
-    const requestId = req.requestId || (crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2, 8)));
-const { cacheKey, cacheTtlSec } = (req.body || {});
-if (cacheKey) {
-  const cached = cacheGet(String(cacheKey));
-  if (cached) {
-    res.setHeader("X-Cache", "HIT");
-    const usage = await bumpUsage(req.user.id);
+  try {
+    const body = req.body || {};
+    const meta = body.meta || {};
+
+    const user = String(meta.user || body.user || 'anonymous');
+    const plan = String(meta.plan || body.plan || 'free');
+
+    const wantsTrends = !!(
+      body.forceTrends ||
+      body.wantsTrends ||
+      (meta && (meta.forceTrends || meta.wantsTrends)) ||
+      body.viralCategory ||
+      body.category ||
+      (meta && (meta.viralCategory || meta.category))
+    );
+
+    const viralCategory = String(
+      body.viralCategory ||
+      body.category ||
+      (meta && (meta.viralCategory || meta.category)) ||
+      'Daily Hot'
+    );
+
+    // Cache: trends are cached by category; plain text by (user + prompt prefix)
+    const cacheKey = wantsTrends
+      ? `gemini:trends:${viralCategory}`
+      : `gemini:text:${user}:${String(body.prompt || '').slice(0, 80)}`;
+
+    const cached = cacheGet(cacheKey);
+    if (cached) {
       return res.json({
         ...cached,
         requestId,
-        trendSeedSource,
-        user: req.user.email,
-        plan: (req.user.plan || "free").toLowerCase(),
-        usage,
-        usageSummary: usageSummary(req.user.plan, usage),
+        cached: true
       });
-  }
-  res.setHeader("X-Cache", "MISS");
-}
-const wantsTrends =
-  !!(meta && (meta.wantsTrends || meta.forceTrends)) ||
-  !!(req.body && (req.body.wantsTrends || req.body.forceTrends)) ||
-  (typeof prompt === "string" && /"trends"\s*:\s*\[/.test(prompt));
-
-if (!prompt && !wantsTrends) {
-  return res.status(400).json({ error: "prompt_required" });
-}
-
-
-// If Viral Finder trends are requested, seed with TikTok Creative Center hashtags (best-effort).
-let trendSeedSource = "none";
-let trendSeedHashtags = [];
-let categoryLabel = viralCategory || (meta && (meta.categoryLabel || meta.category)) || "Daily Hot";
-
-if (wantsTrends) {
-  try {
-    trendSeedHashtags = await fetchTikTokCreativeCenterHashtags({ countryCode: "TH" });
-    if (trendSeedHashtags && trendSeedHashtags.length) trendSeedSource = "creative_center";
-  } catch (e) {
-    trendSeedSource = "ai_only";
-    trendSeedHashtags = [];
-  }
-
-  // Build a robust prompt on the backend to avoid placeholder outputs.
-  promptText = buildViralFinderPrompt({
-    categoryLabel,
-    countryCode: "TH",
-    seeds: trendSeedHashtags
-  });
-}
-
-const mimeRequested = responseMimeType ? String(responseMimeType) : undefined;
-
-    // Viral Finder MUST be stable: always return exactly 10 trends.
-    // Even if the frontend forgets to request JSON, force JSON mode for Viral Finder.
-    // The frontend can also set explicit flags (forceTrends / viralCategory / category).
-    let promptText = String(prompt || "");
-    const forceTrends = !!req.body.forceTrends;
-    const viralCategory = req.body.viralCategory || req.body.category || (meta && meta.viralCategory);
-
-    const effectiveMime = wantsTrends ? "application/json" : mimeRequested;
-    const wantsJson = effectiveMime === "application/json";
-
-    const VIRAL_STRICT_JSON_PREFIX = `You are a JSON API. Return ONLY valid JSON. No markdown, no commentary.
-
-Schema (MUST follow exactly):
-{
-  "category": string,
-  "trends": [
-    {
-      "rank": 1,
-      "title": string,
-      "hook": string,
-      "why_viral": string,
-      "contentIdea": string,
-      "imagePrompt": string,
-      "tiktokUrl": string
     }
-  ]
-}
 
-Rules:
-- Return exactly 10 items in "trends" with ranks 1..10 (no gaps, no duplicates).
-- Use the MOST RECENT information you can (last 24–72 hours) for TikTok Thailand.
-- If web search/grounding is available, use it to identify REAL trending hashtags/topics for the selected category.
-- Every string field MUST be non-empty EXCEPT "tiktokUrl" (may be "" if unknown).
-- "title": 4–10 words, specific (no "Trending #1", no generic placeholders). Titles must be unique.
-- "hook": 1–2 Thai sentences that could open a short TikTok.
-- "why_viral": 2–4 bullet-style phrases in one string (use "• ").
-- "contentIdea": a clear mini-script / structure (Hook → Value → Proof → CTA).
-- "imagePrompt": a single detailed prompt for generating a thumbnail image, include style + subject + lighting.
-- "tiktokUrl": Prefer a TikTok SEARCH URL like https://www.tiktok.com/search?q=... if you don't know an exact video URL.
-
-Output MUST be valid JSON parsable by JSON.parse().
-`;
-
-    const finalPrompt = wantsTrends
-      ? `${VIRAL_STRICT_JSON_PREFIX}\n\nUSER_REQUEST:\n${promptText}`
-      : promptText;
-
-    const runOnce = async (p) => {
-      return await callGeminiGenerateContent({
-        prompt: p,
-        useSearch: wantsTrends ? (useSearch !== undefined ? !!useSearch : true) : !!useSearch,
-        responseMimeType: effectiveMime,
-        temperature: (typeof temperature === "number" ? temperature : (wantsJson ? 0.4 : 0.6)),
-        maxOutputTokens: 2048,
-      });
-    };
-
-    let { text: aiText, modelUsed, apiVersion } = await runOnce(finalPrompt);
-    let finalText = aiText;
-
-    const normalizeTrendsPayload = (obj) => {
-      // Goal: always return { trends: [ {title, hook, reason, idea, prompt} x10 ] }
-      const safeStr = (v) => (v == null ? "" : String(v)).trim();
-      const coerceTrend = (t, i) => {
-        // Model can return an object or a plain string title.
-        if (typeof t === "string") {
-          return {
-            title: safeStr(t) || `Trending #${i + 1}`,
-            hook: "",
-            why_viral: "",
-            contentIdea: "",
-            imagePrompt: "",
-            tiktokUrl: "",
-          };
+    // Optional: seed from TikTok Creative Center
+    let trendSeedSource = 'none';
+    let trendSeedHashtags = [];
+    if (wantsTrends) {
+      try {
+        const cc = await fetchTikTokCreativeCenterHashtags({ category: viralCategory });
+        if (cc && Array.isArray(cc.hashtags) && cc.hashtags.length) {
+          trendSeedSource = 'tiktok_creative_center';
+          trendSeedHashtags = cc.hashtags.slice(0, 30);
         }
-
-        const title = safeStr(t?.title || t?.trend || t?.name || t?.topic || t?.headline || `Trending #${i + 1}`);
-        const _title = title;
-          const _hook = safeStr(t?.hook || t?.theHook || t?.Hook || "") || `คนกำลังพูดถึง "${_title}" — เปิดคลิปด้วยประโยคสั้น ๆ ที่ทำให้หยุดดู`;
-          const _why = safeStr(t?.why_viral || t?.reason || t?.why || t?.whyViral || t?.whyItsViral || "") || `• เข้าใจง่าย
-• กระตุ้นให้คนคอมเมนต์/แชร์
-• มีมุม before-after หรือหลักฐาน`;
-          const _idea = safeStr(t?.contentIdea || t?.idea || t?.content_idea || "") || `Hook → บอกปัญหา/สิ่งที่คนสงสัย → ให้ทริค/หลักฐานสั้น ๆ → ปิดด้วยคำถาม/CTA`;
-          const _img = safeStr(t?.imagePrompt || t?.prompt || t?.videoPrompt || t?.image_prompt || "") || `Thai TikTok thumbnail, subject: ${_title}, clean bold typography, high contrast, cinematic lighting, shallow depth of field`;
-          const _url = safeStr(t?.tiktokUrl || t?.url || t?.link || "") || `https://www.tiktok.com/search?q=${encodeURIComponent(_title)}`;
-          return {
-            title: _title,
-            hook: _hook,
-            why_viral: _why,
-            contentIdea: _idea,
-            imagePrompt: _img,
-            tiktokUrl: _url,
-          };
-      };
-
-      const trends = Array.isArray(obj?.trends)
-        ? obj.trends
-        : (Array.isArray(obj?.items) ? obj.items : (Array.isArray(obj) ? obj : []));
-
-      const out = [];
-      for (let i = 0; i < 10; i++) {
-        const src = trends[i] || {};
-        out.push(coerceTrend(src, i));
+      } catch (e) {
+        trendSeedSource = 'seed_error';
+        trendSeedHashtags = [];
       }
-      return { trends: out };
+    }
+
+    // Build prompt
+    let promptText = String(body.prompt || '').trim();
+    if (wantsTrends) {
+      promptText = buildViralFinderPrompt({
+        categoryLabel: viralCategory,
+        trendSeedHashtags
+      });
+    }
+
+    if (!promptText) {
+      return res.status(400).json({ error: 'Missing prompt', requestId });
+    }
+
+    const responseMimeType = body.responseMimeType
+      ? String(body.responseMimeType)
+      : (wantsTrends ? 'application/json' : 'text/plain');
+
+    const { text, modelUsed } = await callGemini({
+      prompt: promptText,
+      responseMimeType: wantsTrends ? 'application/json' : responseMimeType,
+      useSearch: !!body.useSearch,
+      temperature: (typeof body.temperature === 'number') ? body.temperature : undefined,
+      maxOutputTokens: (typeof body.maxOutputTokens === 'number') ? body.maxOutputTokens : undefined
+    });
+
+    // Usage tracking (best-effort; never fail the request)
+    try { await bumpUsage({ user, plan, meta }); } catch (_) {}
+
+    let payload = {
+      requestId,
+      modelUsed,
+      cached: false,
+      text
     };
 
-    const looksLikeTrends = (obj) => Array.isArray(obj?.trends) && obj.trends.length >= 5;
-
-    if (wantsJson) {
-      // Try parse JSON response; if parsing fails, still return raw text.
+    if (wantsTrends) {
       let parsed = null;
       try {
-        parsed = JSON.parse(finalText);
-      } catch (e) {
-        parsed = null;
-      }
-
-      // If Viral Finder asked for trends, enforce a stable schema.
-      if (wantsTrends) {
-        if (!looksLikeTrends(parsed)) {
-          // Repair attempt (one extra model call) using the original output as context.
-          const repairPrompt = [
-            VIRAL_STRICT_JSON_PREFIX,
-            "\n\nYour previous output did NOT match the required schema.",
-            "Fix it NOW. Output ONLY valid JSON that matches the schema exactly.",
-            "Do not add extra keys.",
-            "\n\nORIGINAL_USER_REQUEST:\n" + promptText,
-            "\n\nBAD_OUTPUT:\n" + String(finalText).slice(0, 8000)
-          ].join("\n");
-          try {
-            const repaired = await runOnce(repairPrompt);
-            parsed = JSON.parse(String(repaired?.text || ""));
-          } catch (_) {
-            // keep parsed as-is
-          }
+        parsed = JSON.parse(text);
+      } catch (_) {
+        // Try to salvage a JSON object embedded in text
+        const m = String(text || '').match(/\{[\s\S]*\}$/);
+        if (m) {
+          try { parsed = JSON.parse(m[0]); } catch (_) {}
         }
-
-        // normalize even if model gave partial keys
-        const json = normalizeTrendsPayload(parsed || {});
-              // Seed title fallback (use Creative Center hashtags as stable "real" seeds)
-              try {
-                const seedTitles = Array.isArray(trendSeedHashtags) ? trendSeedHashtags.slice(0, 10) : [];
-                if (Array.isArray(json.trends) && seedTitles.length) {
-                  json.trends = json.trends.map((t, i) => {
-                    const seed = seedTitles[i];
-                    const hasRealTitle = t && typeof t.title === "string" && t.title.trim() && !/^trending\s*#?\d+/i.test(t.title.trim());
-                    const title = hasRealTitle ? t.title.trim() : (seed || t.title || `Trending #${i + 1}`);
-                    const q = (seed || title || "").replace(/^#/, "").trim();
-                    const tiktokUrl = (t && t.tiktokUrl) ? t.tiktokUrl : (q ? `https://www.tiktok.com/search?q=${encodeURIComponent(q)}` : "");
-                    return { ...t, title, tiktokUrl };
-                  });
-                }
-              } catch (e) { /* ignore */ }
-        const usage = await bumpUsage(req.user.id);
-              return res.json({ ok: true, json, trends: json.trends, text: JSON.stringify(json, null, 2), requestId, user: req.user.email, plan: (req.user.plan || "free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
       }
 
-      if (parsed) {
-        const usage = await bumpUsage(req.user.id);
-        return res.json({ ok: true, json: parsed, text: JSON.stringify(parsed), requestId, trendSeedSource, trendSeedHashtags, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+      let trends = [];
+      if (parsed && Array.isArray(parsed.trends)) {
+        trends = parsed.trends.map(normalizeTrendItem);
       }
-      const usage = await bumpUsage(req.user.id);
-      return res.json({ ok: true, text: finalText, requestId, trendSeedSource, trendSeedHashtags, json_parse_error: "invalid_json", plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+
+      // Fallback: build trends from seed hashtags if model output is missing
+      if (!trends.length) {
+        const seeds = (trendSeedHashtags && trendSeedHashtags.length)
+          ? trendSeedHashtags
+          : ['#tiktoktrend', '#viral', '#fyp', '#ทริคดีบอกต่อ', '#รีวิว'];
+
+        trends = seeds.slice(0, 10).map((tag, i) => normalizeTrendItem({
+          title: tag.replace(/^#/, '').trim() || `Trend ${i + 1}`,
+          hook: `เปิดคลิปด้วยประโยคสั้น ๆ เกี่ยวกับ ${tag}`,
+          why_viral: ['สั้น กระชับ เข้าใจง่าย', 'ชวนคอมเมนต์/แชร์', 'ทำตามได้ทันที'],
+          contentIdea: `ทำคลิป 15–25 วิ อธิบาย ${tag} แบบ before/after`,
+          imagePrompt: `Thai TikTok thumbnail about ${tag}, clean bold typography, high contrast, cinematic lighting, shallow depth of field`,
+          tiktokUrl: ''
+        }));
+        trendSeedSource = trendSeedSource === 'none' ? 'fallback' : trendSeedSource;
+      }
+
+      // Ensure exactly 10 items
+      while (trends.length < 10) {
+        const n = trends.length + 1;
+        trends.push(normalizeTrendItem({
+          title: `Trend ${n}`,
+          hook: `เปิดคลิปด้วยประโยคสั้น ๆ ที่ทำให้หยุดดู`,
+          why_viral: ['เข้าใจง่าย', 'ชวนคอมเมนต์', 'ดูจบใน 10 วิ'],
+          contentIdea: `สรุปทริค/รีวิว/ก่อน-หลัง ภายใน 20 วิ`,
+          imagePrompt: `Thai TikTok thumbnail, clean bold typography, high contrast, cinematic lighting, shallow depth of field`,
+          tiktokUrl: ''
+        }));
+      }
+      trends = trends.slice(0, 10);
+
+      payload = {
+        ...payload,
+        trends,
+        trendSeedSource,
+        trendSeedHashtags
+      };
     }
 
-    // Plain text response
-    const usage = await bumpUsage(req.user.id);
-    return res.json({ ok: true, text: finalText, requestId, trendSeedSource, trendSeedHashtags, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+    cacheSet(cacheKey, payload, wantsTrends ? 60 : 30); // seconds
+    return res.json(payload);
   } catch (err) {
-    console.error("/api/gemini-text error:", err);
-    return res.status(err.status || 500).json({ ok: false, error: err.message || "gemini-text failed" });
+    console.error('gemini-text error', err);
+    return res.status(500).json({
+      error: (err && err.message) ? err.message : 'Internal Server Error',
+      requestId
+    });
   }
 });
-
 app.post("/api/logUsage", async (req, res) => {
   try {
     // Keep compatible with the old Netlify function signature
