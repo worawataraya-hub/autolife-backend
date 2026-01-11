@@ -1205,7 +1205,7 @@ function looksLikeTrendsPayload(obj) {
 
 // Compatibility wrapper: older routes call `callGemini(...)`
 // but the implementation is `callGeminiGenerateContent(...)`.
-async function callGemini(arg, extra = {}) {
+async async function callGemini(arg, extra = {}) {
   // Supports: callGemini({prompt, ...}) OR callGemini("prompt", {...})
   if (typeof arg === 'string') {
     return await callGeminiGenerateContent({ prompt: arg, ...extra });
