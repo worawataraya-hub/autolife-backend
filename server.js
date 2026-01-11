@@ -1219,12 +1219,12 @@ Output MUST be valid JSON parsable by JSON.parse().
         // normalize even if model gave partial keys
         const json = normalizeTrendsPayload(parsed || {});
         const usage = await bumpUsage(req.user.id);
-        return res.json({ ok: true, json, text: JSON.stringify(json), requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+        return res.json({ ok: true, category: json.category, trends: json.trends, json, text: JSON.stringify(json), requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
       }
 
       if (parsed) {
         const usage = await bumpUsage(req.user.id);
-        return res.json({ ok: true, json: parsed, text: JSON.stringify(parsed), requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+        return res.json({ ok: true, category: parsed.category, trends: parsed.trends, json: parsed, text: JSON.stringify(parsed), requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
       }
       const usage = await bumpUsage(req.user.id);
       return res.json({ ok: true, text: finalText, requestId, json_parse_error: "invalid_json", plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
