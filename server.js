@@ -1205,6 +1205,7 @@ function looksLikeTrendsPayload(obj) {
 app.post("/api/gemini-text", authRequired, hydrateUserPlan, quotaGuard(), async (req, res) => {
   try {
     const { prompt, responseMimeType, useSearch, temperature, maxOutputTokens, meta } = req.body || {};
+    const mimeRequested = (typeof responseMimeType === "string" && responseMimeType.trim()) ? responseMimeType.trim() : "text/plain";
 
     const requestId = req.requestId || (crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2, 8)));
 const { cacheKey, cacheTtlSec } = (req.body || {});
@@ -1240,6 +1241,7 @@ if (!promptText && !wantsTrends) {
 // (public page) as a lightweight seed source; AI then expands to "Trending 1-10" structure.
 let trendSeedSource = "none";
 let trendSeedHashtags = [];
+let baseTrends = [];
 const countryCode = String((req.body && req.body.countryCode) || (meta && meta.countryCode) || "TH").toUpperCase();
 
 if (wantsTrends) {
@@ -1262,11 +1264,26 @@ if (wantsTrends) {
     "Daily Hot";
 
   // Rebuild the prompt for strict JSON trends output
+    // Build a deterministic base list so the UI never falls back to "Trending #1" placeholders
+  // even if the model refuses/returns malformed JSON.
+  baseTrends = (Array.isArray(trendSeedHashtags) && trendSeedHashtags.length)
+    ? trendSeedHashtags.slice(0, 10).map((tag, idx) => ({
+        rank: idx + 1,
+        title: String(tag || "").replace(/^#/, "").trim() || `Trend ${idx + 1}`,
+        tiktokUrl: buildTikTokHashtagUrl(tag),
+      }))
+    : [];
+
+  // Rebuild the prompt for strict JSON trends output (ask model to KEEP titles from baseTrends when provided)
   promptText = buildViralFinderPrompt({
     categoryLabel,
     countryCode,
     seeds: trendSeedHashtags,
   });
+
+  if (baseTrends.length) {
+    promptText += `\n\nIMPORTANT: Use these EXACT 10 titles (do not rename). Fill hook/why_viral/contentIdea/imagePrompt for each.\nBASE_TRENDS_JSON:\n${JSON.stringify({ trends: baseTrends }, null, 2)}\n`;
+  }
 }
 
 
@@ -1403,6 +1420,28 @@ Output MUST be valid JSON parsable by JSON.parse().
 
         // normalize even if model gave partial keys
         const json = normalizeTrendsPayload(parsed || {});
+        // If we have seed titles, enforce them when model returns placeholders/duplicates.
+        if (Array.isArray(baseTrends) && baseTrends.length === 10 && Array.isArray(json.trends)) {
+          const used = new Set();
+          for (let i = 0; i < 10; i++) {
+            const bt = baseTrends[i];
+            const cur = json.trends[i] || {};
+            const curTitle = String(cur.title || "").trim();
+            const isPlaceholder = !curTitle || /^Trending\s*#\d+/i.test(curTitle) || /^Trend\s*\d+$/i.test(curTitle);
+            if (isPlaceholder) {
+              cur.title = bt.title;
+              cur.tiktokUrl = cur.tiktokUrl || bt.tiktokUrl || "";
+            }
+            // De-dup titles if model repeats them
+            let t = String(cur.title || "").trim();
+            if (used.has(t)) {
+              cur.title = bt.title;
+              t = String(cur.title || "").trim();
+            }
+            used.add(t);
+            json.trends[i] = cur;
+          }
+        }
         const usage = await bumpUsage(req.user.id);
         return res.json({ ok: true, json, text: JSON.stringify(json), requestId, trendSeedSource, trendSeedHashtags, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
       }
