@@ -1048,6 +1048,156 @@ async function generateLockedReviewJson(model, basePrompt, options = {}) {
 }
 
 
+
+// --- TikTok Creative Center trend seed (best-effort, no official API) ---
+async function fetchTikTokCreativeCenterHashtags({ countryCode = "TH" } = {}) {
+  // Creative Center URLs change; try multiple. We only need hashtag names (top list).
+  const urls = [
+    `https://ads.tiktok.com/business/creativecenter/inspiration/popular/hashtag/pc/en?countryCode=${countryCode}`,
+    `https://ads.tiktok.com/business/creativecenter/inspiration/popular/hashtag/pc/en?region=${countryCode}`,
+    `https://ads.tiktok.com/business/creativecenter/inspiration/popular/hashtag/pc/en?regionCode=${countryCode}`,
+    `https://ads.tiktok.com/business/creativecenter/inspiration/popular/hashtag/pc/en`,
+  ];
+
+  const tryFetch = async (u) => {
+    const resp = await fetch(u, {
+      headers: {
+        "user-agent": "Mozilla/5.0 (compatible; AutoLifeBot/1.0; +https://autolife-ai.netlify.app/)",
+        "accept": "text/html,application/xhtml+xml",
+      },
+      redirect: "follow",
+    });
+    if (!resp.ok) throw new Error(`creative_center_http_${resp.status}`);
+    return await resp.text();
+  };
+
+  let html = null;
+  let lastErr = null;
+  for (const u of urls) {
+    try {
+      html = await tryFetch(u);
+      if (html && html.includes("__NEXT_DATA__")) break;
+    } catch (e) { lastErr = e; }
+  }
+  if (!html) throw lastErr || new Error("creative_center_fetch_failed");
+
+  const m = html.match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+  if (!m) throw new Error("creative_center_next_data_not_found");
+  const nextDataText = m[1].trim();
+  const nextData = JSON.parse(nextDataText);
+
+  // Walk the JSON and collect hashtag-like strings.
+  const tags = new Map(); // tag -> score (best-effort)
+  const seen = new Set();
+  const walk = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    for (const [k, v] of Object.entries(node)) {
+      if (typeof v === "string") {
+        const s = v.trim();
+        if (!s) continue;
+        // Candidate hashtag
+        if (s.startsWith("#") && s.length >= 3 && s.length <= 60) {
+          const t = s;
+          if (!seen.has(t)) { seen.add(t); tags.set(t, 0); }
+        }
+      } else if (typeof v === "number") {
+        // Try to use numbers near hashtag names as a score (views / popularity)
+        // We'll handle in the object case below where both name and count exist.
+      } else if (v && typeof v === "object") {
+        // if object contains name/title and some count field, capture score
+        const maybeName = (typeof v.name === "string" && v.name.trim()) ? v.name.trim()
+          : (typeof v.hashtagName === "string" && v.hashtagName.trim()) ? v.hashtagName.trim()
+          : (typeof v.title === "string" && v.title.trim()) ? v.title.trim()
+          : null;
+
+        const maybeCount = (typeof v.viewCount === "number") ? v.viewCount
+          : (typeof v.views === "number") ? v.views
+          : (typeof v.playCount === "number") ? v.playCount
+          : (typeof v.count === "number") ? v.count
+          : null;
+
+        if (maybeName && (maybeName.startsWith("#") || k.toLowerCase().includes("hashtag"))) {
+          const tag = maybeName.startsWith("#") ? maybeName : `#${maybeName}`;
+          const prev = tags.get(tag) || 0;
+          const score = (typeof maybeCount === "number" && isFinite(maybeCount)) ? maybeCount : 0;
+          if (!seen.has(tag)) seen.add(tag);
+          tags.set(tag, Math.max(prev, score));
+        }
+
+        walk(v);
+      }
+    }
+  };
+  walk(nextData);
+
+  // Sort by score desc then alphabetically (stable).
+  const sorted = Array.from(tags.entries())
+    .map(([tag, score]) => ({ tag, score: Number(score) || 0 }))
+    .sort((a, b) => (b.score - a.score) || a.tag.localeCompare(b.tag));
+
+  // Deduplicate and take top 20 seeds.
+  const seeds = [];
+  for (const it of sorted) {
+    const t = it.tag;
+    if (!t || seeds.includes(t)) continue;
+    seeds.push(t);
+    if (seeds.length >= 20) break;
+  }
+  return seeds;
+}
+
+function buildTikTokHashtagUrl(tag) {
+  const clean = String(tag || "").replace(/^#/, "").trim();
+  if (!clean) return "";
+  return `https://www.tiktok.com/tag/${encodeURIComponent(clean)}`;
+}
+
+function buildViralFinderPrompt({ categoryLabel, countryCode, seeds }) {
+  const today = new Date().toISOString().slice(0, 10);
+  const seedBlock = (Array.isArray(seeds) && seeds.length)
+    ? seeds.map((t, i) => `${i + 1}. ${t}`).join("\n")
+    : "";
+
+  return `You are "AI Viral Finder".
+Task: Find REAL TikTok Thailand trends and analyze them in 4 dimensions (Hook, Why Viral, Idea, Prompt).
+Date: ${today}
+Country: ${countryCode || "TH"}
+Category: ${categoryLabel || "Daily Hot"}
+
+If seed hashtags are provided below, they come from TikTok Creative Center and MUST be used as the base of your trends.
+If seeds are empty, you must still output plausible, distinct, current Thai TikTok trends (no placeholders like "Trending #1").
+
+Seed Hashtags (use as base topics):
+${seedBlock || "(none)"}
+
+Return ONLY valid JSON. No markdown.
+
+Output schema (EXACT):
+{
+  "trends": [
+    {
+      "rank": number,
+      "title": string,
+      "hook": string,
+      "why_viral": string,
+      "contentIdea": string,
+      "imagePrompt": string,
+      "tiktokUrl": string
+    }
+  ]
+}
+
+Rules:
+- Return EXACTLY 10 items, rank 1..10 (no gaps, no duplicates).
+- Titles MUST be unique and specific (Thai language ok).
+- Every string field MUST be non-empty EXCEPT "tiktokUrl" (can be empty if unknown).
+- "tiktokUrl" should be a direct TikTok tag URL if possible.
+- "imagePrompt" should be a short Thai TikTok thumbnail / cover prompt.
+`;
+}
+
+
 function looksLikeTrendsPayload(obj) {
   return !!(obj && typeof obj === "object" && Array.isArray(obj.trends));
 }
@@ -1063,19 +1213,48 @@ if (cacheKey) {
   if (cached) {
     res.setHeader("X-Cache", "HIT");
     const usage = await bumpUsage(req.user.id);
-    return res.json({ ...cached, requestId, cached: true, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+    return res.json({ ...cached, requestId, trendSeedSource, trendSeedHashtags, cached: true, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
   }
   res.setHeader("X-Cache", "MISS");
 }
+const wantsTrends =
+  !!(meta && (meta.wantsTrends || meta.forceTrends)) ||
+  !!(req.body && (req.body.wantsTrends || req.body.forceTrends)) ||
+  (typeof prompt === "string" && /"trends"\s*:\s*\[/.test(prompt));
 
-    if (!prompt) return res.status(400).json({ error: "prompt_required" });
+if (!prompt && !wantsTrends) {
+  return res.status(400).json({ error: "prompt_required" });
+}
 
-    const mimeRequested = responseMimeType ? String(responseMimeType) : undefined;
+
+// If Viral Finder trends are requested, seed with TikTok Creative Center hashtags (best-effort).
+let trendSeedSource = "none";
+let trendSeedHashtags = [];
+let categoryLabel = viralCategory || (meta && (meta.categoryLabel || meta.category)) || "Daily Hot";
+
+if (wantsTrends) {
+  try {
+    trendSeedHashtags = await fetchTikTokCreativeCenterHashtags({ countryCode: "TH" });
+    if (trendSeedHashtags && trendSeedHashtags.length) trendSeedSource = "creative_center";
+  } catch (e) {
+    trendSeedSource = "ai_only";
+    trendSeedHashtags = [];
+  }
+
+  // Build a robust prompt on the backend to avoid placeholder outputs.
+  promptText = buildViralFinderPrompt({
+    categoryLabel,
+    countryCode: "TH",
+    seeds: trendSeedHashtags
+  });
+}
+
+const mimeRequested = responseMimeType ? String(responseMimeType) : undefined;
 
     // Viral Finder MUST be stable: always return exactly 10 trends.
     // Even if the frontend forgets to request JSON, force JSON mode for Viral Finder.
     // The frontend can also set explicit flags (forceTrends / viralCategory / category).
-    const promptText = String(prompt);
+    let promptText = String(prompt || "");
     const forceTrends = !!req.body.forceTrends;
     const viralCategory = req.body.viralCategory || req.body.category || (meta && meta.viralCategory);
     const wantsTrends = (
@@ -1219,20 +1398,20 @@ Output MUST be valid JSON parsable by JSON.parse().
         // normalize even if model gave partial keys
         const json = normalizeTrendsPayload(parsed || {});
         const usage = await bumpUsage(req.user.id);
-        return res.json({ ok: true, category: json.category, trends: json.trends, json, text: JSON.stringify(json), requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+        return res.json({ ok: true, json, text: JSON.stringify(json), requestId, trendSeedSource, trendSeedHashtags, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
       }
 
       if (parsed) {
         const usage = await bumpUsage(req.user.id);
-        return res.json({ ok: true, category: parsed.category, trends: parsed.trends, json: parsed, text: JSON.stringify(parsed), requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+        return res.json({ ok: true, json: parsed, text: JSON.stringify(parsed), requestId, trendSeedSource, trendSeedHashtags, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
       }
       const usage = await bumpUsage(req.user.id);
-      return res.json({ ok: true, text: finalText, requestId, json_parse_error: "invalid_json", plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+      return res.json({ ok: true, text: finalText, requestId, trendSeedSource, trendSeedHashtags, json_parse_error: "invalid_json", plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
     }
 
     // Plain text response
     const usage = await bumpUsage(req.user.id);
-    return res.json({ ok: true, text: finalText, requestId, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+    return res.json({ ok: true, text: finalText, requestId, trendSeedSource, trendSeedHashtags, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
   } catch (err) {
     console.error("/api/gemini-text error:", err);
     return res.status(err.status || 500).json({ ok: false, error: err.message || "gemini-text failed" });
