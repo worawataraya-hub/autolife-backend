@@ -1205,7 +1205,7 @@ function looksLikeTrendsPayload(obj) {
 
 // Compatibility wrapper: older routes call `callGemini(...)`
 // but the implementation is `callGeminiGenerateContent(...)`.
-async async function callGemini(arg, extra = {}) {
+async function callGemini(arg, extra = {}) {
   // Supports: callGemini({prompt, ...}) OR callGemini("prompt", {...})
   if (typeof arg === 'string') {
     return await callGeminiGenerateContent({ prompt: arg, ...extra });
@@ -1261,10 +1261,10 @@ app.post('/api/gemini-text', async (req, res) => {
     let trendSeedHashtags = [];
     if (wantsTrends) {
       try {
-        const cc = await fetchTikTokCreativeCenterHashtags({ category: viralCategory });
-        if (cc && Array.isArray(cc.hashtags) && cc.hashtags.length) {
+        const ccSeeds = await fetchTikTokCreativeCenterHashtags({ category: viralCategory });
+        if (Array.isArray(ccSeeds) && ccSeeds.length) {
           trendSeedSource = 'tiktok_creative_center';
-          trendSeedHashtags = cc.hashtags.slice(0, 30);
+          trendSeedHashtags = ccSeeds.slice(0, 30);
         }
       } catch (e) {
         trendSeedSource = 'seed_error';
@@ -1298,7 +1298,7 @@ app.post('/api/gemini-text', async (req, res) => {
     });
 
     // Usage tracking (best-effort; never fail the request)
-    try { await bumpUsage({ user, plan, meta }); } catch (_) {}
+    try { await bumpUsage(user); } catch (_) {}
 
     let payload = {
       requestId,
