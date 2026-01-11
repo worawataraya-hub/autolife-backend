@@ -1107,11 +1107,16 @@ Schema (MUST follow exactly):
 }
 
 Rules:
-- "trends" MUST be an array with EXACTLY 10 items (rank 1..10). No fewer, no more.
-- Each title MUST be a distinct TikTok trend/topic for the requested category. Avoid duplicates.
-- tiktokUrl MUST be a valid-looking TikTok URL (https://www.tiktok.com/...) relevant to the title. If you are unsure, still provide a plausible TikTok search URL format.
-- Keep hook/why_viral/contentIdea/imagePrompt concise (1-2 lines each).
-- Language: Write MOSTLY in Thai. You may include some English terms when natural (e.g., product names, hashtags, prompt keywords).
+- Return exactly 10 items in "trends" with ranks 1..10 (no gaps, no duplicates).
+- Every string field MUST be non-empty.
+- "title": 4–10 words, specific (no "Trending #1", no generic placeholders).
+- "hook": 1–2 sentences that could open a short TikTok (Thai allowed).
+- "why_viral": 2–4 bullet-style phrases in one string (use "• ").
+- "contentIdea": a clear mini-script / structure (Hook → Value → CTA).
+- "imagePrompt": a single detailed prompt for generating a thumbnail image, include style + subject + lighting.
+- "tiktokUrl": if you don't know a real URL, use "" (empty string) ONLY for this field.
+
+Output MUST be valid JSON parsable by JSON.parse().
 `;
 
     const finalPrompt = wantsTrends
