@@ -1147,65 +1147,6 @@ async function fetchTikTokCreativeCenterHashtags({ countryCode = "TH" } = {}) {
   return seeds;
 }
 
-
-async function fetchTrendSeedsViaGeminiSearch({ categoryLabel = "Daily Hot", countryCode = "TH" } = {}) {
-  // Fallback: ask Gemini (with grounding/search) to list currently trending TikTok hashtags/topics.
-  // NOTE: TikTok has no official public global trending API; this is an AI+search assisted seed list.
-  const SEED_SCHEMA_PREFIX = `You are a JSON API. Return ONLY valid JSON. No markdown, no commentary.
-
-Schema:
-{
-  "tags": [ string ]
-}
-
-Rules:
-- Return 20-30 items in "tags".
-- Each item must be a Thai TikTok trend hashtag or short topic phrase for the LAST 24-72 hours.
-- Prefer Thailand if countryCode=TH.
-- Use concise strings. Hashtags can include leading "#".
-- No placeholders like "Trending #1".
-- Output MUST be valid JSON parsable by JSON.parse().
-`;
-
-  const prompt = [
-    SEED_SCHEMA_PREFIX,
-    `countryCode: ${countryCode}`,
-    `category: ${categoryLabel}`,
-    "Task: List the most currently trending TikTok hashtags/topics for this category and country."
-  ].join("\n");
-
-  try {
-    const { text } = await callGeminiGenerateContent({
-      prompt,
-      useSearch: true,
-      responseMimeType: "application/json",
-      temperature: 0.2,
-      maxOutputTokens: 1024,
-    });
-    let parsed = null;
-    try { parsed = JSON.parse(String(text || "")); } catch (_) { parsed = null; }
-    const raw = Array.isArray(parsed?.tags) ? parsed.tags : [];
-    const cleaned = raw
-      .map((x) => String(x || "").trim())
-      .filter((x) => x && !/^Trending\s*#\d+/i.test(x) && x.length <= 60);
-    // Normalize to hashtag form (optional)
-    const uniq = [];
-    const seen = new Set();
-    for (const t of cleaned) {
-      const tag = t.startsWith("#") ? t : `#${t.replace(/^#+/, "")}`;
-      const key = tag.toLowerCase();
-      if (!seen.has(key)) {
-        seen.add(key);
-        uniq.push(tag);
-      }
-      if (uniq.length >= 30) break;
-    }
-    return uniq;
-  } catch (_) {
-    return [];
-  }
-}
-
 function buildTikTokHashtagUrl(tag) {
   const clean = String(tag || "").replace(/^#/, "").trim();
   if (!clean) return "";
@@ -1264,7 +1205,6 @@ function looksLikeTrendsPayload(obj) {
 app.post("/api/gemini-text", authRequired, hydrateUserPlan, quotaGuard(), async (req, res) => {
   try {
     const { prompt, responseMimeType, useSearch, temperature, maxOutputTokens, meta } = req.body || {};
-    const mimeRequested = (typeof responseMimeType === "string" && responseMimeType.trim()) ? responseMimeType.trim() : "text/plain";
 
     const requestId = req.requestId || (crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2, 8)));
 const { cacheKey, cacheTtlSec } = (req.body || {});
@@ -1273,88 +1213,58 @@ if (cacheKey) {
   if (cached) {
     res.setHeader("X-Cache", "HIT");
     const usage = await bumpUsage(req.user.id);
-    return res.json({ ...cached, requestId, trendSeedSource: cached.trendSeedSource || "cache", trendSeedHashtags: cached.trendSeedHashtags || [], cached: true, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+      return res.json({
+        ...cached,
+        requestId,
+        trendSeedSource,
+        user: req.user.email,
+        plan: (req.user.plan || "free").toLowerCase(),
+        usage,
+        usageSummary: usageSummary(req.user.plan, usage),
+      });
   }
   res.setHeader("X-Cache", "MISS");
 }
+const wantsTrends =
+  !!(meta && (meta.wantsTrends || meta.forceTrends)) ||
+  !!(req.body && (req.body.wantsTrends || req.body.forceTrends)) ||
+  (typeof prompt === "string" && /"trends"\s*:\s*\[/.test(prompt));
 
-// wantsTrends detection is handled below after promptText/viralCategory are defined.
-
-let promptText = String(prompt || "");
-    const forceTrends = !!req.body.forceTrends;
-    const viralCategory = req.body.viralCategory || req.body.category || (meta && meta.viralCategory);
-    const wantsTrends = (
-      forceTrends ||
-      !!viralCategory ||
-      (meta && typeof meta === "object" && meta.tool === "viral_finder_trends") ||
-      /viral\s*f\w*nder|viral\s*finder|trending\s*1-?10|\"trends\"\s*:|\btrends\b/i.test(promptText)
-    );
-
-// Validate prompt (allow empty when asking for trends only)
-if (!promptText && !wantsTrends) {
+if (!prompt && !wantsTrends) {
   return res.status(400).json({ error: "prompt_required" });
 }
 
-// If caller wants TikTok trends, try to seed the prompt with real public trend keywords/hashtags.
-// NOTE: TikTok does not provide an official public global "top trending" API. We use Creative Center
-// (public page) as a lightweight seed source; AI then expands to "Trending 1-10" structure.
+
+// If Viral Finder trends are requested, seed with TikTok Creative Center hashtags (best-effort).
 let trendSeedSource = "none";
 let trendSeedHashtags = [];
-let baseTrends = [];
-const countryCode = String((req.body && req.body.countryCode) || (meta && meta.countryCode) || "TH").toUpperCase();
+let categoryLabel = viralCategory || (meta && (meta.categoryLabel || meta.category)) || "Daily Hot";
 
 if (wantsTrends) {
   try {
-    trendSeedHashtags = await fetchTikTokCreativeCenterHashtags({ countryCode });
-    if (Array.isArray(trendSeedHashtags) && trendSeedHashtags.length) {
-      trendSeedSource = "creative_center";
-    } else {
-      trendSeedSource = "ai_only";
-      trendSeedHashtags = [];
-    }
+    trendSeedHashtags = await fetchTikTokCreativeCenterHashtags({ countryCode: "TH" });
+    if (trendSeedHashtags && trendSeedHashtags.length) trendSeedSource = "creative_center";
   } catch (e) {
     trendSeedSource = "ai_only";
     trendSeedHashtags = [];
   }
 
-  const categoryLabel =
-    (viralCategory && String(viralCategory)) ||
-    (meta && meta.categoryLabel) ||
-    "Daily Hot";
-
-
-// If Creative Center scraping produced no seeds, use Gemini+search to get a better seed list.
-if (!Array.isArray(trendSeedHashtags) || trendSeedHashtags.length === 0) {
-  const viaGemini = await fetchTrendSeedsViaGeminiSearch({ categoryLabel, countryCode });
-  if (Array.isArray(viaGemini) && viaGemini.length) {
-    trendSeedHashtags = viaGemini.slice(0, 30);
-    trendSeedSource = "gemini_search";
-  }
-}
-
-  // Rebuild the prompt for strict JSON trends output
-    // Build a deterministic base list so the UI never falls back to "Trending #1" placeholders
-  // even if the model refuses/returns malformed JSON.
-  baseTrends = (Array.isArray(trendSeedHashtags) && trendSeedHashtags.length)
-    ? trendSeedHashtags.slice(0, 10).map((tag, idx) => ({
-        rank: idx + 1,
-        title: String(tag || "").replace(/^#/, "").trim() || `Trend ${idx + 1}`,
-        tiktokUrl: buildTikTokHashtagUrl(tag),
-      }))
-    : [];
-
-  // Rebuild the prompt for strict JSON trends output (ask model to KEEP titles from baseTrends when provided)
+  // Build a robust prompt on the backend to avoid placeholder outputs.
   promptText = buildViralFinderPrompt({
     categoryLabel,
-    countryCode,
-    seeds: trendSeedHashtags,
+    countryCode: "TH",
+    seeds: trendSeedHashtags
   });
-
-  if (baseTrends.length) {
-    promptText += `\n\nIMPORTANT: Use these EXACT 10 titles (do not rename). Fill hook/why_viral/contentIdea/imagePrompt for each.\nBASE_TRENDS_JSON:\n${JSON.stringify({ trends: baseTrends }, null, 2)}\n`;
-  }
 }
 
+const mimeRequested = responseMimeType ? String(responseMimeType) : undefined;
+
+    // Viral Finder MUST be stable: always return exactly 10 trends.
+    // Even if the frontend forgets to request JSON, force JSON mode for Viral Finder.
+    // The frontend can also set explicit flags (forceTrends / viralCategory / category).
+    let promptText = String(prompt || "");
+    const forceTrends = !!req.body.forceTrends;
+    const viralCategory = req.body.viralCategory || req.body.category || (meta && meta.viralCategory);
 
     const effectiveMime = wantsTrends ? "application/json" : mimeRequested;
     const wantsJson = effectiveMime === "application/json";
@@ -1489,30 +1399,22 @@ Output MUST be valid JSON parsable by JSON.parse().
 
         // normalize even if model gave partial keys
         const json = normalizeTrendsPayload(parsed || {});
-        // If we have seed titles, enforce them when model returns placeholders/duplicates.
-        if (Array.isArray(baseTrends) && baseTrends.length === 10 && Array.isArray(json.trends)) {
-          const used = new Set();
-          for (let i = 0; i < 10; i++) {
-            const bt = baseTrends[i];
-            const cur = json.trends[i] || {};
-            const curTitle = String(cur.title || "").trim();
-            const isPlaceholder = !curTitle || /^Trending\s*#\d+/i.test(curTitle) || /^Trend\s*\d+$/i.test(curTitle);
-            if (isPlaceholder) {
-              cur.title = bt.title;
-              cur.tiktokUrl = cur.tiktokUrl || bt.tiktokUrl || "";
-            }
-            // De-dup titles if model repeats them
-            let t = String(cur.title || "").trim();
-            if (used.has(t)) {
-              cur.title = bt.title;
-              t = String(cur.title || "").trim();
-            }
-            used.add(t);
-            json.trends[i] = cur;
-          }
-        }
+              // Seed title fallback (use Creative Center hashtags as stable "real" seeds)
+              try {
+                const seedTitles = Array.isArray(trendSeedHashtags) ? trendSeedHashtags.slice(0, 10) : [];
+                if (Array.isArray(json.trends) && seedTitles.length) {
+                  json.trends = json.trends.map((t, i) => {
+                    const seed = seedTitles[i];
+                    const hasRealTitle = t && typeof t.title === "string" && t.title.trim() && !/^trending\s*#?\d+/i.test(t.title.trim());
+                    const title = hasRealTitle ? t.title.trim() : (seed || t.title || `Trending #${i + 1}`);
+                    const q = (seed || title || "").replace(/^#/, "").trim();
+                    const tiktokUrl = (t && t.tiktokUrl) ? t.tiktokUrl : (q ? `https://www.tiktok.com/search?q=${encodeURIComponent(q)}` : "");
+                    return { ...t, title, tiktokUrl };
+                  });
+                }
+              } catch (e) { /* ignore */ }
         const usage = await bumpUsage(req.user.id);
-        return res.json({ ok: true, json, text: JSON.stringify(json), requestId, trendSeedSource, trendSeedHashtags, plan: String(req.user.plan||"free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
+              return res.json({ ok: true, json, trends: json.trends, text: JSON.stringify(json, null, 2), requestId, user: req.user.email, plan: (req.user.plan || "free").toLowerCase(), usage, usageSummary: usageSummary(req.user.plan, usage) });
       }
 
       if (parsed) {
