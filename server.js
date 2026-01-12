@@ -1260,6 +1260,38 @@ async function callGemini(arg, extra = {}) {
   throw new Error('callGemini: invalid arguments');
 }
 
+function getPromptFromBody(body) {
+  if (!body || typeof body !== 'object') return '';
+  const candidates = [
+    body.prompt,
+    body.text,
+    body.input,
+    body.message,
+    body.query,
+    body.content,
+    body.userPrompt,
+    body.user_prompt,
+    body.instructions,
+    body.instruction,
+    body.task,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim()) return c.trim();
+  }
+  return '';
+}
+
+function getBoolean(body, key, fallback=false) {
+  if (!body || typeof body !== 'object') return fallback;
+  const v = body[key];
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'string') {
+    if (v.toLowerCase() === 'true') return true;
+    if (v.toLowerCase() === 'false') return false;
+  }
+  return fallback;
+}
+
 app.post('/api/gemini-text', async (req, res) => {
   const requestId = crypto.randomUUID();
 
