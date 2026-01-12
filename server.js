@@ -1317,7 +1317,7 @@ app.post('/api/gemini-text', async (req, res) => {
     }
 
     // Build prompt
-    let promptText = String(body.prompt || '').trim();
+    let promptText = String((body.prompt ?? body.text ?? body.input ?? '')).trim();
     if (wantsTrends) {
       promptText = buildViralFinderPrompt({
         categoryLabel: viralCategory,
