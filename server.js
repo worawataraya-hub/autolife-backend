@@ -1350,6 +1350,13 @@ app.post('/api/gemini-text', async (req, res) => {
       cached: false,
       text
     };
+    // If caller requested JSON, try to parse once on the server for more reliable clients
+    if (wantsJson && !wantsTrends) {
+      const parsed = tryParseJson(text);
+      if (parsed.ok) payload.json = parsed.value;
+      else payload.json = null;
+    }
+
 
     if (wantsTrends) {
       let parsed = null;
