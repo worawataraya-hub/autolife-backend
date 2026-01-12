@@ -441,6 +441,50 @@ function thaiMonthKey(d = new Date()) {
   return `${y}-${m}`;
 }
 
+
+// ---------- AI FALLBACK ----------
+function buildFallbackText(prompt = "") {
+  const p = String(prompt || "");
+  const lower = p.toLowerCase();
+
+  // Viral Finder style: request 10 trends / JSON
+  if (lower.includes("trending") || lower.includes("viral finder") || lower.includes("trends")) {
+    // Return a JSON string so the frontend parser can still work.
+    const base = [
+      "tiktoktrend","viral","fyp","trending","howto","review","unboxing","beforeafter","dayinmylife","storytime"
+    ];
+    const now = new Date();
+    const stamp = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
+    const trends = Array.from({length: 10}).map((_,i)=> {
+      const tag = base[(i + now.getDate()) % base.length];
+      return {
+        rank: i+1,
+        title: `${tag} (${stamp})`,
+        hashtag: `#${tag}`,
+        tiktok_url: `https://www.tiktok.com/tag/${tag}`,
+        hook: `เปิดคลิปด้วยประโยคสั้น ๆ เกี่ยวกับ #${tag} ให้คนหยุดดู`,
+        reason: ["สั้น กระชับ เข้าใจง่าย", "ชวนคอมเมนต์/แชร์", "ทำตามได้ทันที"],
+        idea: `ทำคลิป 15–25 วิ แบบ before/after หรือสาธิตสั้น ๆ เกี่ยวกับ #${tag}`,
+        prompt: `Thai TikTok thumbnail about #${tag}, clean bold typography, high contrast, cinematic lighting, shallow depth of field`
+      };
+    });
+    return JSON.stringify({ source: "fallback", trends }, null, 2);
+  }
+
+  // Review Generator / generic text fallback
+  return [
+    "⚠️ ระบบ AI ตอบกลับไม่ทันในตอนนี้ (ใช้ข้อความสำรอง)",
+    "",
+    "โครงรีวิวสั้น (ปรับใช้ได้ทันที):",
+    "1) เปิดด้วยปัญหาที่คนเจอ",
+    "2) บอกผลลัพธ์หลังใช้/จุดเด่น 2–3 ข้อ",
+    "3) วิธีใช้/ทริคสั้น ๆ",
+    "4) ปิดด้วยคำถาม + CTA",
+    "",
+    "ถ้าต้องการแบบละเอียด ให้กดสร้างใหม่อีกครั้งนะครับ"
+  ].join("\n");
+}
+
 // ---------- AUTH ----------
 function signToken(user) {
   return jwt.sign(
