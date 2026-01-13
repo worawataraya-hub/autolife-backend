@@ -1297,6 +1297,7 @@ app.post('/api/gemini-text', async (req, res) => {
 
   try {
     const body = req.body || {};
+  const wantsJson = !!body.wantsJson;
     const meta = body.meta || {};
 
     const user = String(meta.user || body.user || 'anonymous');
