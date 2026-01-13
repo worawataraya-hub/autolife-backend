@@ -1200,8 +1200,9 @@ function buildTikTokHashtagUrl(tag) {
 function buildViralFinderPrompt({ categoryLabel, countryCode, seeds }) {
   const today = new Date().toISOString().slice(0, 10);
   const seedBlock = (Array.isArray(seeds) && seeds.length)
-    ? seeds.map((t, i) => `${i + 1}. ${t}`).join("\n")
-    : "";
+    ? seeds.map((t, i) => `${i + 1}. ${t}`).join("
+")
+    : "(none)";
 
   return `You are "AI Viral Finder".
 Task: Find REAL TikTok Thailand trends and analyze them in 4 dimensions (Hook, Why Viral, Idea, Prompt).
@@ -1210,27 +1211,38 @@ Country: ${countryCode || "TH"}
 Category: ${categoryLabel || "Daily Hot"}
 
 If seed hashtags are provided below, they come from TikTok Creative Center and MUST be used as the base of your trends.
-If seeds are empty, you must still output plausible, distinct, current Thai TikTok trends (no placeholders like "Trending #1").
+If seeds are (none), you must still output plausible, distinct, current Thai TikTok trends (no placeholders like "Trending #1").
 
 Seed Hashtags (use as base topics):
-${seedBlock || "(none)"}
+${seedBlock}
 
-Return ONLY valid JSON. No markdown.
+OUTPUT FORMAT (STRICT):
+Return ONLY a valid JSON object with this shape:
 
-Output schema (EXACT):
 {
+  "trendSeedSource": "tiktok" | "ai",
+  "trendSeedHashtags": ["string", ...],
   "trends": [
     {
-      "rank": number,
-      "title": string,
-      "hook": string,
-      "why_viral": string,
-      "contentIdea": string,
-      "imagePrompt": string,
-      "tiktokUrl": string
+      "title": "string",
+      "tiktokLink": "string (optional)",
+      "hook": "string",
+      "whyViral": "string",
+      "idea": "string",
+      "imagePrompt": "string"
     }
   ]
 }
+
+Rules:
+- Provide exactly 10 items in "trends".
+- "title" must be concise (no numbering like "#1").
+- "hook", "whyViral", "idea" should be Thai (short, actionable).
+- "imagePrompt" should be a short Thai TikTok thumbnail / cover prompt.
+- Do NOT wrap JSON in markdown. Do NOT add extra keys.
+`;
+}
+
 
 Rules:
 - Return EXACTLY 10 items, rank 1..10 (no gaps, no duplicates).
