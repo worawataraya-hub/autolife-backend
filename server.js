@@ -1200,8 +1200,7 @@ function buildTikTokHashtagUrl(tag) {
 function buildViralFinderPrompt({ categoryLabel, countryCode, seeds }) {
   const today = new Date().toISOString().slice(0, 10);
   const seedBlock = (Array.isArray(seeds) && seeds.length)
-    ? seeds.map((t, i) => `${i + 1}. ${t}`).join("
-")
+    ? seeds.map((t, i) => `${i + 1}. ${t}`).join("\n")
     : "(none)";
 
   return `You are "AI Viral Finder".
@@ -1244,14 +1243,6 @@ Rules:
 }
 
 
-Rules:
-- Return EXACTLY 10 items, rank 1..10 (no gaps, no duplicates).
-- Titles MUST be unique and specific (Thai language ok).
-- Every string field MUST be non-empty EXCEPT "tiktokUrl" (can be empty if unknown).
-- "tiktokUrl" should be a direct TikTok tag URL if possible.
-- "imagePrompt" should be a short Thai TikTok thumbnail / cover prompt.
-`;
-}
 
 
 function looksLikeTrendsPayload(obj) {
@@ -1417,7 +1408,7 @@ app.post('/api/gemini-text', async (req, res) => {
 
       let trends = [];
       if (parsed && Array.isArray(parsed.trends)) {
-        trends = parsed.trends.map(normalizeTrendItem);
+        trends = parsed.trends.map((t, i) => normalizeTrendItem(t, i));
       }
 
       // Fallback: build trends from seed hashtags if model output is missing
