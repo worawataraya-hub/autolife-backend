@@ -774,7 +774,7 @@ async function callGeminiGenerateContent({ prompt, temperature = 0.6, maxOutputT
           data?.candidates?.[0]?.content?.parts?.[0]?.text ||
           "";
 
-        if (!textOut) {
+        if (!textOut || !String(textOut).trim()) {
           const err = new Error(`Gemini empty response (${apiVersion}/${model})`);
           err.status = 502;
           err.body = JSON.stringify(data).slice(0, 2000);
