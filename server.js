@@ -1388,9 +1388,33 @@ app.post('/api/gemini-text', async (req, res) => {
     };
     // If caller requested JSON, try to parse once on the server for more reliable clients
     if (wantsJson && !wantsTrends) {
-      const parsed = tryParseJson(text);
-      if (parsed.ok) payload.json = parsed.value;
-      else payload.json = null;
+      // If model didn't return valid JSON even though wantsJson=true, retry once with a stricter instruction.
+      let parsed = tryParseJson(text);
+      if (!parsed.ok) {
+        try {
+          const strictPrompt = `${promptText}
+
+IMPORTANT: Return ONLY valid JSON. No markdown, no explanations, no trailing commas.`;
+          const r2 = await callGeminiGenerateContent({
+            prompt: strictPrompt,
+            model: modelUsed,
+            temperature: 0.2,
+            maxOutputTokens,
+            responseMimeType: responseMimeType || "application/json",
+          });
+          const t2 = String(r2.text || "").trim();
+          if (t2) {
+            text = t2;
+            payload.text = text;
+          } else {
+            throw new Error("empty_json_retry");
+          }
+          parsed = tryParseJson(text);
+        } catch (e) {
+          // Ignore retry errors; we'll fall back to null json below.
+        }
+      }
+      payload.json = parsed.ok ? parsed.value : null;
     }
 
 
