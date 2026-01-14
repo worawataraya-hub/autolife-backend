@@ -1339,21 +1339,7 @@ app.post('/api/gemini-text', async (req, res) => {
     // Optional: seed from TikTok Creative Center
     let trendSeedSource = 'none';
     let trendSeedHashtags = [];
-    
-    // Normalize common JSON wrappers for clients (e.g., { sellers: [...] } -> [...])
-    if (wantsJson && payload.json && !Array.isArray(payload.json)) {
-      const j = payload.json;
-      if (Array.isArray(j.sellers)) payload.json = j.sellers;
-      else if (Array.isArray(j.items)) payload.json = j.items;
-      else if (Array.isArray(j.data)) payload.json = j.data;
-      else if (Array.isArray(j.results)) payload.json = j.results;
-    }
-    // If JSON exists but text is empty, provide a stringified fallback
-    if (wantsJson && payload.json && (!payload.text || !payload.text.trim())) {
-      try { payload.text = JSON.stringify(payload.json, null, 2); } catch (_) {}
-    }
-
-if (wantsTrends) {
+    if (wantsTrends) {
       try {
         const ccSeeds = await fetchTikTokCreativeCenterHashtags({ category: viralCategory });
         if (Array.isArray(ccSeeds) && ccSeeds.length) {
@@ -1391,12 +1377,15 @@ if (wantsTrends) {
       maxOutputTokens: (typeof body.maxOutputTokens === 'number') ? body.maxOutputTokens : undefined
     });
 
-    // Always return raw text (even when client requests JSON/trends)
-    payload.text = (text || '').toString();
-
-
     // Usage tracking (best-effort; never fail the request)
     try { await bumpUsage(user); } catch (_) {}
+
+    if (!text || !String(text).trim()) {
+      // Model returned empty string after retries/fallback
+      return res.status(502).json({ ok:false, error:"AI returned empty text", modelUsed: model, wantsJson });
+    }
+
+    const parsedJson = wantsJson ? extractFirstJson(text) : null;
 
     let payload = {
       requestId,
