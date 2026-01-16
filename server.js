@@ -471,6 +471,18 @@ function buildFallbackText(prompt = "") {
     return JSON.stringify({ source: "fallback", trends }, null, 2);
   }
 
+// Review Generator: request top sellers list
+if (lower.includes("top 20") || lower.includes("top20") || lower.includes("sellers") || lower.includes("free sample")) {
+  const sellers = [
+    { id: 1, name: "Serum", brand: "Comm Comm", img: "" },
+    { id: 2, name: "Lens", brand: "Comm Comm", img: "" },
+    { id: 3, name: "Inhaler", brand: "Comm Comm", img: "" },
+    { id: 4, name: "Lip", brand: "Comm Comm", img: "" }
+  ];
+  return JSON.stringify({ sellers, note: "fallback_sellers" });
+}
+
+
   // Review Generator / generic text fallback
   return [
     "⚠️ ระบบ AI ตอบกลับไม่ทันในตอนนี้ (ใช้ข้อความสำรอง)",
