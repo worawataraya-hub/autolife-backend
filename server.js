@@ -728,7 +728,7 @@ function isModelNotFound(err) {
   return /model.*not found/i.test(msg) || /404\s+not found/i.test(msg);
 }
 
-async function callGeminiGenerateContent({ prompt, temperature = 0.6, maxOutputTokens = 1024, responseMimeType }) {
+async function callGeminiGenerateContent({ prompt, temperature = 0.6, maxOutputTokens = 2048, responseMimeType }) {
   if (!GEMINI_API_KEY) {
     const err = new Error("Missing GEMINI_API_KEY");
     err.status = 500;
@@ -1386,7 +1386,7 @@ app.post('/api/gemini-text', async (req, res) => {
       responseMimeType: wantsTrends ? 'application/json' : responseMimeType,
       useSearch: !!body.useSearch,
       temperature: (typeof body.temperature === 'number') ? body.temperature : undefined,
-      maxOutputTokens: (typeof body.maxOutputTokens === 'number') ? body.maxOutputTokens : undefined
+      maxOutputTokens: (typeof body.maxOutputTokens === 'number') ? body.maxOutputTokens : (wantsJson ? 2200 : 1400)
     });
 
     // Usage tracking (best-effort; never fail the request)
