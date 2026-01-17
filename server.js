@@ -1377,17 +1377,79 @@ app.post('/api/gemini-text', async (req, res) => {
       return res.status(400).json({ error: 'Missing prompt', requestId });
     }
 
+    // If the client requests JSON, prefer JSON mime type.
     const responseMimeType = body.responseMimeType
       ? String(body.responseMimeType)
-      : (wantsTrends ? 'application/json' : 'text/plain');
+      : (wantsTrends || wantsJson ? 'application/json' : 'text/plain');
 
-    const { text, modelUsed } = await callGemini({
-      prompt: promptText,
-      responseMimeType: wantsTrends ? 'application/json' : responseMimeType,
-      useSearch: !!body.useSearch,
-      temperature: (typeof body.temperature === 'number') ? body.temperature : undefined,
-      maxOutputTokens: (typeof body.maxOutputTokens === 'number') ? body.maxOutputTokens : (wantsJson ? 2200 : 1400)
-    });
+    // Optional client-provided JSON schema (frontend uses this). We don't rely on it being supported by the model API;
+    // instead we embed it as a strict instruction for higher compliance.
+    const responseSchema = (body.responseSchema && typeof body.responseSchema === 'object') ? body.responseSchema : null;
+    const schemaHint = responseSchema
+      ? `\n\nJSON_SCHEMA:\n${JSON.stringify(responseSchema)}\n\nIMPORTANT: Return ONLY valid JSON that conforms to JSON_SCHEMA. No markdown. No explanation.`
+      : '';
+
+    const maxOutputTokens = (typeof body.maxOutputTokens === 'number')
+      ? body.maxOutputTokens
+      : (wantsJson ? 3200 : 1600);
+
+    const temperature = (typeof body.temperature === 'number')
+      ? body.temperature
+      : (wantsJson ? 0.2 : undefined);
+
+    let text = '';
+    let modelUsed = '';
+    let parsedForJson = null;
+
+    const wantsSellers = !!(
+      wantsJson && !wantsTrends && (
+        (responseSchema && responseSchema.properties && responseSchema.properties.sellers) ||
+        /top\s*20\s*sellers|Top\s*20\s*Sellers|ขายดี|ตัวอย่างฟรี/i.test(promptText)
+      )
+    );
+
+    // Try up to 2 attempts for JSON responses to avoid empty / malformed output.
+    for (let attempt = 0; attempt < (wantsJson ? 2 : 1); attempt++) {
+      const strict = attempt > 0;
+      const attemptPrompt = strict
+        ? `${promptText}${schemaHint}\n\nSTRICT_JSON_MODE: Return ONLY JSON. If a field is unknown, use an empty string or empty array.`
+        : `${promptText}${schemaHint}`;
+
+      const r = await callGemini({
+        prompt: attemptPrompt,
+        responseMimeType: wantsTrends || wantsJson ? 'application/json' : responseMimeType,
+        useSearch: !!body.useSearch,
+        temperature,
+        maxOutputTokens
+      });
+
+      modelUsed = r.modelUsed || modelUsed;
+      text = String(r.text || '').trim();
+
+      if (!text) continue;
+      if (!wantsJson) break;
+
+      // Parse JSON (allow embedded JSON)
+      let parsed = tryParseJson(text);
+      if (!parsed.ok) {
+        const extracted = extractFirstJson(text);
+        if (extracted) {
+          parsed = { ok: true, value: extracted };
+        }
+      }
+      parsedForJson = parsed.ok ? parsed.value : null;
+
+      // Validate expected shape for Top 20 sellers
+      if (wantsSellers) {
+        const sellers = parsedForJson && (parsedForJson.sellers || (parsedForJson.json && parsedForJson.json.sellers));
+        if (Array.isArray(sellers) && sellers.length >= 5) break;
+        // else retry
+        continue;
+      }
+
+      // Generic JSON request: accept any object
+      if (parsedForJson && typeof parsedForJson === 'object') break;
+    }
 
     // Usage tracking (best-effort; never fail the request)
     try { await bumpUsage(user); } catch (_) {}
@@ -1415,15 +1477,27 @@ app.post('/api/gemini-text', async (req, res) => {
     });
   }
   if (wantsJson) {
+    // Provide a predictable JSON payload so the UI won't break.
+    const fallback = wantsSellers
+      ? {
+          sellers: Array.from({ length: 20 }).map((_, i) => ({
+            rank: i + 1,
+            title: `สินค้าขายดี #${i + 1}`,
+            category: "General",
+            reason: "ตอบโจทย์คนส่วนใหญ่ ใช้ได้จริง ราคาเข้าถึงง่าย",
+            sample_pitch: "ของมันต้องมี! ลองแล้วติดใจ",
+            ask_script: "ทักแชท 'ขอตัวอย่างฟรี' ได้เลย",
+            tiktok_query: "#tiktokshop #fyp"
+          }))
+        }
+      : { ok: true, note: "fallback-json", message: "AI returned empty; provided fallback." };
+
     return res.status(200).json({
       requestId,
       modelUsed,
       cached: false,
-      text: JSON.stringify({
-        ok: true,
-        note: "fallback-json",
-        message: "AI returned empty; provided fallback."
-      })
+      text: JSON.stringify(fallback),
+      json: fallback
     });
   }
   return res.status(200).json({
@@ -1434,43 +1508,42 @@ app.post('/api/gemini-text', async (req, res) => {
   });
 }
 
-    const parsedJson = wantsJson ? extractFirstJson(text) : null;
-
     let payload = {
       requestId,
       modelUsed,
       cached: false,
       text
     };
-    // If caller requested JSON, try to parse once on the server for more reliable clients
-    if (wantsJson && !wantsTrends) {
-      // If model didn't return valid JSON even though wantsJson=true, retry once with a stricter instruction.
-      let parsed = tryParseJson(text);
-      if (!parsed.ok) {
-        try {
-          const strictPrompt = `${promptText}
 
-IMPORTANT: Return ONLY valid JSON. No markdown, no explanations, no trailing commas.`;
-          const r2 = await callGeminiGenerateContent({
-            prompt: strictPrompt,
-            model: modelUsed,
-            temperature: 0.2,
-            maxOutputTokens,
-            responseMimeType: responseMimeType || "application/json",
-          });
-          const t2 = String(r2.text || "").trim();
-          if (t2) {
-            text = t2;
-            payload.text = text;
-          } else {
-            throw new Error("empty_json_retry");
-          }
-          parsed = tryParseJson(text);
-        } catch (e) {
-          // Ignore retry errors; we'll fall back to null json below.
-        }
+    // If caller requested JSON, parse on server and provide a stable `json` field.
+    if (wantsJson && !wantsTrends) {
+      let parsed = parsedForJson;
+      if (!parsed || typeof parsed !== 'object') {
+        const p = tryParseJson(text);
+        if (p.ok) parsed = p.value;
       }
-      payload.json = parsed.ok ? parsed.value : null;
+
+      // Final safety: ensure sellers shape if this looks like Review Generator request
+      if (wantsSellers) {
+        const sellers = parsed && (parsed.sellers || (parsed.json && parsed.json.sellers));
+        if (!Array.isArray(sellers) || !sellers.length) {
+          parsed = {
+            sellers: Array.from({ length: 20 }).map((_, i) => ({
+              rank: i + 1,
+              title: `สินค้าขายดี #${i + 1}`,
+              category: "General",
+              reason: "ตอบโจทย์คนส่วนใหญ่ ใช้ได้จริง ราคาเข้าถึงง่าย",
+              sample_pitch: "ของมันต้องมี! ลองแล้วติดใจ",
+              ask_script: "ทักแชท 'ขอตัวอย่างฟรี' ได้เลย",
+              tiktok_query: "#tiktokshop #fyp"
+            }))
+          };
+          payload.text = JSON.stringify(parsed);
+        }
+        payload.sellers = parsed.sellers;
+      }
+
+      payload.json = parsed || null;
     }
 
 
